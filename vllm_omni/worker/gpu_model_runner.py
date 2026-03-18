@@ -43,6 +43,45 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
 
+    def profile_run(self) -> None:
+        """Override to handle models that return empty hidden_states.
+        
+        Some models (e.g., Kimi-Audio TTS) return empty tensors from _dummy_run()
+        during profiling. This override skips the sampler/pooler for such models.
+        """
+        # Call parent profile_run to handle multimodal encoder profiling
+        # but catch the case where hidden_states is empty
+        try:
+            super().profile_run()
+        except RuntimeError as e:
+            if "mat1 and mat2 shapes cannot be multiplied" in str(e):
+                # This happens when hidden_states is empty (e.g., Kimi-Audio TTS)
+                logger.debug(
+                    "[profile_run] Skipping sampler for model with empty hidden_states "
+                    "(common for TTS/audio models): %s", e
+                )
+                # Clear encoder cache and sync as the parent would have done
+                self._sync_device()
+                self.encoder_cache.clear()
+                import gc
+                gc.collect()
+            else:
+                raise
+
+    def _dummy_sampler_run(self, hidden_states: torch.Tensor) -> None:
+        """Override to handle empty hidden_states.
+        
+        Some models (e.g., Kimi-Audio TTS) return empty tensors from _dummy_run().
+        This override skips the sampler for such models to avoid shape mismatch errors.
+        """
+        if hidden_states is None or hidden_states.numel() == 0:
+            logger.debug(
+                "[_dummy_sampler_run] Skipping sampler for empty hidden_states "
+                "(common for TTS/audio models)"
+            )
+            return
+        super()._dummy_sampler_run(hidden_states)
+
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
 
@@ -849,6 +888,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         # ranks execute the rearrangement in synchronization.
         if not skip_eplb:
             self.eplb_step(is_dummy=True, is_profile=is_profile)
+
+        # Handle models that return None from forward pass (e.g., Kimi-Audio TTS)
+        if hidden_states is None:
+            logger.debug(
+                "[_dummy_run] Model returned None for hidden_states, "
+                "returning empty tensors (common for TTS/audio models)"
+            )
+            return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
 
         logit_indices = np.cumsum(num_scheduled_tokens) - 1
         logit_indices_device = torch.from_numpy(logit_indices).to(self.device, non_blocking=True)

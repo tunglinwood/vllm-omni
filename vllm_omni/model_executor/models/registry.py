@@ -129,6 +129,17 @@ _OMNI_MODELS = {
         "hunyuan_image3",
         "HunyuanImage3ForConditionalGeneration",
     ),
+    ## kimi_audio_tts
+    "KimiAudioTalkerForConditionalGeneration": (
+        "kimi_audio_tts",
+        "kimi_audio_talker",
+        "KimiAudioTalkerForConditionalGeneration",
+    ),
+    "KimiAudioCode2Wav": (
+        "kimi_audio_tts",
+        "kimi_audio_code2wav",
+        "KimiAudioCode2Wav",
+    ),
 }
 
 

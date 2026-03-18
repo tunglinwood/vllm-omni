@@ -1,0 +1,125 @@
+%%{init: {"theme": "default", "layout": "elk"}}%%
+	
+flowchart TB
+      subgraph Input["Input Processing"]
+          AUDIO["Audio File<br/>.wav/.mp3"] -->|"OpenAI API<br/>/audio/transcriptions"| API["OpenAISpeechToText<br/>vllm/entrypoints/openai"]
+          API -->|"extract audio<br/>numpy array"| FEAT["WhisperFeatureExtractor<br/>transformers"]
+      end
+
+      subgraph CustomKimi["Custom Kimi-Audio Components<br/>vllm/"]
+          FEAT -->|"input_features"| KP["KimiAudioProcessor<br/>vllm/transformers_utils/processors/kimi_audio.py"]
+          KP -->|"process<br/>whisper_input_features"| MM["KimiAudioMultiModalProcessor<br/>vllm/multimodal/"]
+
+          TOKEN["KimiAudioTokenizer<br/>vllm/tokenizers/kimi_audio.py"] -->|"encode tokens<br/>tiktoken"| MM
+
+          subgraph MMProc["Multimodal Processing"]
+              MM -->|"get_dummy_inputs"| DUMMY["KimiAudioDummyInputsBuilder"]
+              MM -->|"processing info"| INFO["KimiAudioProcessingInfo"]
+          end
+      end
+
+      subgraph Model["KimiAudioForConditionalGeneration<br/>vllm/model_executor/models/kimi_audio.py<br/>ASR Path - vLLM Main Package"]
+          MM -->|"multimodal kwargs"| EMB["embed_multimodal<br/>interface method"]
+
+          subgraph AudioTower["Audio Tower"]
+              EMB -->|"whisper_input_features"| WHISPER["KimiAudioWhisperEncoder<br/>extends WhisperEncoder<br/>packed_modules_mapping"]
+              WHISPER -->|"audio_features<br/>B,S,5120"| PROJ["KimiAudioMultiModalProjector<br/>Linear 5120 to 3584"]
+          end
+
+          PROJ -->|"scaled x sqrt2<br/>B,S,3584"| FUSE["_fuse_embeddings<br/>add with text"]
+
+          subgraph TextEmbed["Text Embedding"]
+              EMB -->|"input_ids"| TXTEMB["language_model.embed_tokens<br/>from Qwen2"]
+              TXTEMB -->|"text_embeds<br/>B,L,3584"| FUSE
+          end
+
+          FUSE -->|"inputs_embeds<br/>B,L+D,3584"| LLM["language_model<br/>Qwen2ForCausalLM<br/>28 layers"]
+
+          subgraph VLLMOutput["vLLM Output"]
+              LLM -->|"hidden_states"| NORM["norm<br/>LayerNorm"]
+              NORM -->|"normalized"| HEAD["lm_head<br/>Linear 3584 to vocab"]
+              HEAD -->|"logits"| PROC["LogitsProcessor<br/>vllm/layers"]
+          end
+      end
+		  
+      subgraph Config["Configuration"]
+          MC["ModelConfig<br/>vllm/config"] -->|"model config"| Model
+          MMC["KimiAudioConfig<br/>transformers"] -->|"audio config"| KP
+      end
+
+      subgraph Registry["Model Registry"]
+          REG["MULTIMODAL_REGISTRY<br/>vllm/multimodal/registry"] -->|"register"| MM
+          REG -->|"lookup by model"| Worker
+          REG_OMNI["OmniModelRegistry<br/>vllm_omni/model_executor/models/registry.py"] -->|"register"| TTS_MODEL
+      end
+
+      subgraph Worker["Worker Execution<br/>vLLM Main Package"]
+          WORKER["Worker<br/>vllm/worker"] -->|"init_model"| Model
+          WORKER -->|"execute_model"| LLM
+          CACHE["CacheEngine<br/>vllm/cache"] -->|"KV cache"| LLM
+      end
+
+      InputMetadata["InputMetadata<br/>vllm/model_executor"] -->|"seq metadata"| EMB
+
+      subgraph Output["Output Generation<br/>ASR - Speech to Text"]
+          PROC -->|"token_ids"| SAMP["Sampler<br/>vllm/v1/sample"]
+          SAMP -->|"generated tokens"| DECODE["tokenizer.decode<br/>tiktoken"]
+          DECODE -->|"text"| RESP["TranscriptionResponse<br/>OpenAI compatible"]
+      end
+
+      subgraph TTS["TTS Path - Audio Generation<br/>vLLM-Omni Package"]
+          TEXT_IN["Text Input"] --> TTS_EMB["embed_tokens<br/>vllm_omni/model_executor/models/kimi_audio_tts/"]
+          TTS_EMB --> TTS_BACKBONE["Backbone Layers 0-21<br/>Shared with ASR"]
+          TTS_BACKBONE --> BIFURCATE["Bifurcation @ Layer 21<br/>Clone hidden_states"]
+          
+          BIFURCATE --> TEXT_PATH["Text Path<br/>Layers 22-27"]
+          TEXT_PATH --> TEXT_NORM["norm"]
+          TEXT_NORM --> TEXT_HEAD["lm_head"]
+          TEXT_HEAD --> TEXT_LOGITS["Text Logits<br/>Optional"]
+          
+          BIFURCATE --> AUDIO_PATH["Audio Path<br/>MIMO Layers 0-5"]
+          AUDIO_PATH --> MIMO_NORM["mimo_norm<br/>LayerNorm"]
+          MIMO_NORM --> MIMO_OUT["mimo_output<br/>ParallelLMHead<br/>Full vocab 168448"]
+          MIMO_OUT --> AUDIO_LOGITS["Audio Logits<br/>Slice [152064:168448]"]
+          AUDIO_LOGITS --> TTS_SAMP["Sampler<br/>vllm_omni/v1/sample"]
+          TTS_SAMP --> AUDIO_TOKENS["Audio Tokens<br/>[B, L, 16384]"]
+      end
+
+      subgraph Stage1["Stage 1: Code2Wav<br/>vLLM-Omni Package"]
+          AUDIO_TOKENS --> CONNECTOR["SharedMemoryConnector<br/>vllm_omni/distributed/omni_connectors/"]
+          CONNECTOR -->|"codec_chunk_frames: 25<br/>left_context: 25"| DETOKEN["KimiAudioCode2Wav<br/>vllm_omni/model_executor/models/kimi_audio_tts/kimi_audio_code2wav.py"]
+          DETOKEN -->|"load audio_detokenizer/model.pt"| VOCODER["Audio Detokenizer<br/>Vocoder"]
+          VOCODER --> WAVEFORM["Audio Waveform<br/>24kHz float32"]
+      end
+
+      subgraph OmniWorker["Omni Worker Execution<br/>vLLM-Omni Package"]
+          OMNI_WORKER["GPUWorker<br/>vllm_omni/worker/"] -->|"init_model"| TTS_MODEL
+          OMNI_WORKER -->|"execute_model"| AUDIO_PATH
+          OMNI_WORKER -->|"execute_model"| DETOKEN
+          OMNI_CACHE["CacheEngine<br/>vllm_omni/cache"] -->|"KV cache"| AUDIO_PATH
+      end
+
+      subgraph OmniEngine["Omni Engine<br/>vLLM-Omni Package"]
+          OMNI_ENGINE["OmniEngineCore<br/>vllm_omni/engine/"] -->|"generate"| TTS
+          OMNI_ENGINE -->|"generate"| Stage1
+          STAGE_SCHED["OmniScheduler<br/>vllm_omni/core/sched/"] -->|"schedule"| OMNI_ENGINE
+      end
+
+      LLM -.->|"ASR: Text Output"| Output
+      TTS_BACKBONE -.->|"TTS: Bifurcation"| BIFURCATE
+      BIFURCATE -.->|"Audio Path"| Stage1
+
+      style Input fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+      style CustomKimi fill:#fff9c4,stroke:#f57f17,stroke-width:2px
+      style Model fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
+      style AudioTower fill:#ffe0b2,stroke:#e65100,stroke-width:2px
+      style TextEmbed fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
+      style VLLMOutput fill:#bbdefb,stroke:#1565c0,stroke-width:2px
+      style Output fill:#90caf9,stroke:#0d47a1,stroke-width:2px
+      style Config fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+      style Registry fill:#e1bee7,stroke:#7b1fa2,stroke-width:2px
+      style Worker fill:#ffccbc,stroke:#bf360c,stroke-width:2px
+      style TTS fill:#fff3e0,stroke:#e65100,stroke-width:3px,stroke-dasharray: 5 5
+      style Stage1 fill:#ffebee,stroke:#c62828,stroke-width:3px
+      style OmniWorker fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+      style OmniEngine fill:#f8bbd9,stroke:#ad1457,stroke-width:2px

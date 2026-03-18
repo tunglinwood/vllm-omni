@@ -124,6 +124,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.get_req_chunk[req_id]
         external_req_id = self.request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+        logger.info(f"[Stage-{stage_id}] recv_loop: polling for {connector_get_key}")
 
         # Use timeout=0 for non-blocking poll
         try:
@@ -137,7 +138,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return False
 
         if result is None:
+            logger.info(f"[Stage-{stage_id}] recv_loop: no data yet for {connector_get_key}")
             return False
+        
+        logger.info(f"[Stage-{stage_id}] recv_loop: received data for {connector_get_key}, keys={result.keys() if isinstance(result, dict) else type(result)}")
         payload_data, size = result
 
         if payload_data:
@@ -168,7 +172,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             # Mark as finished for consumption
             self._finished_load_reqs.add(req_id)
-            logger.debug(f"[Stage-{stage_id}] Received one chunk for key {connector_get_key}")
+            logger.info(f"[Stage-{stage_id}] Received chunk for {connector_get_key}, code_predictor_codes len={len(new_ids)}, added to _finished_load_reqs")
             return True
 
         return False
@@ -208,6 +212,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request_id = request.external_req_id
         chunk_id = self.put_req_chunk[request_id]
         connector_put_key = f"{request_id}_{stage_id}_{chunk_id}"
+        logger.info(f"[Stage-{stage_id}] save_loop: processing task for {request_id}, chunk_id={chunk_id}, is_finished={is_finished}")
         # Process payload in save_loop thread
         payload_data = None
         if self.custom_process_next_stage_input_func:
@@ -218,13 +223,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request=request,
                     is_finished=is_finished,
                 )
+                logger.info(f"[Stage-{stage_id}] save_loop: custom_process returned payload with keys={payload_data.keys() if payload_data else None}")
 
             except Exception as e:
                 logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
 
         if not payload_data:
+            logger.warning(f"[Stage-{stage_id}] save_loop: no payload_data, skipping put")
             return
 
+        logger.info(f"[Stage-{stage_id}] save_loop: calling connector.put for {connector_put_key}, payload keys={payload_data.keys()}")
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -234,7 +242,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if success:
             self.put_req_chunk[request_id] += 1
-            logger.debug(f"[Stage-{stage_id}] Sent {connector_put_key}")
+            logger.info(f"[Stage-{stage_id}] Sent {connector_put_key}, chunk_id now={self.put_req_chunk[request_id]}")
+        else:
+            logger.error(f"[Stage-{stage_id}] Failed to send {connector_put_key}")
 
         if is_finished:
             self.code_prompt_token_ids.pop(request_id, None)

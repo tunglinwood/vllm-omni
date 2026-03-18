@@ -354,10 +354,12 @@ class AsyncOmni(OmniBase):
                 yield output
             return
 
-        logger.debug(f"[{self._name}] generate() called")
+        logger.info(f"[{self._name}] generate() called with request_id={request_id}")
         try:
             # Start output handler on the first call to generate()
+            logger.info(f"[{self._name}] Starting output handler")
             self._run_output_handler()
+            logger.info(f"[{self._name}] Output handler started, output_handler={self.output_handler}")
 
             # TODO: lora_request, trace_headers, priority are not supported yet
             if sampling_params_list is None:
@@ -749,6 +751,7 @@ class AsyncOmni(OmniBase):
         request_states = self.request_states
 
         async def output_handler():
+            logger.info(f"[{self._name}] output_handler started")
             try:
                 while True:
                     idle = True
@@ -757,6 +760,7 @@ class AsyncOmni(OmniBase):
                         if result is None:
                             continue
                         idle = False
+                        logger.info(f"[{self._name}] output_handler collected result from stage-{stage_id}: {result.get('type', 'unknown')}")
                         if result.get("type") == "stage_ready":
                             # Only happens when stage is initialized slower than expected,
                             # so we wait for a short time and try again

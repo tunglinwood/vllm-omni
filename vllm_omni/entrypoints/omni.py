@@ -452,7 +452,9 @@ class OmniBase:
     def _is_async_chunk_enable(self, stage_args: list) -> bool:
         """get async chunk flag"""
         engine_args = getattr(stage_args[0], "engine_args", None)
-        return bool(getattr(engine_args, "async_chunk", False))
+        result = bool(getattr(engine_args, "async_chunk", False))
+        logger.info(f"[{self._name}] _is_async_chunk_enable: engine_args.async_chunk={getattr(engine_args, 'async_chunk', None)}, returning {result}")
+        return result
 
     def _start_stages(self, model: str) -> None:
         """Start all stage processes."""
@@ -1183,7 +1185,7 @@ class Omni(OmniBase):
             }
             self.stage_list[0].submit(task)
             _req_start_ts[req_id] = time.time()
-            logger.debug(f"[{self._name}] Enqueued request {req_id} to stage-0")
+            logger.info(f"[{self._name}] Enqueued request {req_id} to stage-0, task keys={task.keys()}")
 
         # Submit CFG companion requests to stage-0
         if cfg.is_active:

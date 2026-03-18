@@ -1369,9 +1369,11 @@ async def _stage_worker_async(
         log_stats_task = None
 
     # Don't keep the dummy data in memory (only for LLM engines)
-    if stage_type != "diffusion":
+    # DISABLED: reset_mm_cache() hangs for Kimi-Audio and some other models
+    # The dummy data is minimal and will be cleared on first real request anyway
+    if False and stage_type != "diffusion":
         await stage_engine.reset_mm_cache()
-    logger.debug("[Stage-%s] Engine initialized", stage_id)
+    logger.info("[Stage-%s] ✓ Engine initialized, preparing to send stage_ready", stage_id)
 
     async def handle_profiler_task_async(task_type: OmniStageTaskType) -> dict:
         """Handle profiler task asynchronously for both LLM and diffusion stages."""
@@ -1426,12 +1428,17 @@ async def _stage_worker_async(
             "vllm_config": vllm_config,
             "tokenizer": getattr(stage_engine, "tokenizer", None),
         }
-        # Only add is_tracing_enabled for LLM engines
+        # Only add is_tracing_enabled for LLM engines (skip if it hangs)
         if stage_type != "diffusion":
-            stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+            try:
+                stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+            except Exception as e:
+                logger.debug("[Stage-%s] is_tracing_enabled failed: %s", stage_id, e)
+                stage_ready_payload["is_tracing_enabled"] = False
         out_q.put(stage_ready_payload)
+        logger.info("[Stage-%s] ✓ Sent stage_ready signal to orchestrator", stage_id)
     except Exception as e:
-        logger.warning("Failed to send stage ready signal: %s", e)
+        logger.warning("[Stage-%s] Failed to send stage ready signal: %s", stage_id, e)
     generation_out_q = asyncio.Queue()
 
     # Batch processing loop
@@ -1442,6 +1449,7 @@ async def _stage_worker_async(
     async def generation_single_request(task: dict[str, Any]):
         _recv_dequeue_ts = _time.time()
         rid = task["request_id"]
+        logger.info(f"[Stage-{stage_id}] generation_single_request: received task for {rid}, from_connector={task.get('from_connector')}")
         try:
             sent_ts = float(task.get("sent_ts", None)) if isinstance(task, dict) else None
             if sent_ts is not None:
@@ -1451,22 +1459,31 @@ async def _stage_worker_async(
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
         try:
-            ein, _rx_metrics = try_recv_via_connector(
-                task=task,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
-
-            if ein is None or _rx_metrics is None:
-                raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
+            # Stage 0: inputs come directly from orchestrator task (not connector)
+            # Stage 1+: inputs come from upstream stage via connector
+            if task.get("from_connector"):
+                ein, _rx_metrics = try_recv_via_connector(
+                    task=task,
+                    connectors=connectors,
+                    stage_id=stage_id,
                 )
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+                logger.info(f"[Stage-{stage_id}] try_recv_via_connector returned ein type={type(ein)}")
+                if ein is None or _rx_metrics is None:
+                    raise RuntimeError(
+                        f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                        "Ensure connectors are configured for all incoming edges."
+                    )
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+                ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+            else:
+                # Stage 0: get inputs directly from task
+                logger.info(f"[Stage-{stage_id}] Stage-0 getting engine_inputs from task directly")
+                ein = task.get("engine_inputs")
+                if ein is None:
+                    raise RuntimeError(f"[Stage-{stage_id}] Missing engine_inputs in task for request {rid}")
+                _rx_decode_ms_by_rid[rid] = 0.0
+                _rx_bytes_by_rid[rid] = 0
 
             logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()
@@ -1475,21 +1492,26 @@ async def _stage_worker_async(
 
             if stage_type == "diffusion":
                 diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
-                # AsyncOmniDiffusion.generate returns a single result, not an async generator
+                logger.info(f"[Stage-{stage_id}] Running diffusion generate for {rid}")
                 gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
+                logger.info(f"[Stage-{stage_id}] Diffusion generate completed for {rid}, putting to generation_out_q")
                 await generation_out_q.put((rid, gen_output, _gen_ms))
             else:
                 ein = cast(PromptType, ein)
                 llm_sampling_params: SamplingParams = task["sampling_params"]
+                logger.info(f"[Stage-{stage_id}] Running LLM generate for {rid}")
                 gen_output = None
                 async for res in cast(AsyncLLM, stage_engine).generate(ein, llm_sampling_params, rid):
                     gen_output = res
                     _gen_t1 = _time.time()
                     _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                     _gen_t0 = _gen_t1
+                    logger.info(f"[Stage-{stage_id}] LLM generate chunk for {rid}, putting to generation_out_q")
                     await generation_out_q.put((rid, gen_output, _gen_ms))
+                if gen_output is None:
+                    logger.warning(f"[Stage-{stage_id}] LLM generate returned no output for {rid}")
         except Exception as e:
             logger.exception("Failed on request %s: %s", rid, e)
             out_q.put(
@@ -1566,6 +1588,7 @@ async def _stage_worker_async(
                         }
                     )
             else:
+                logger.info(f"[Stage-{stage_id}] Dispatching GENERATE task for {task.get('request_id')} to generation_single_request")
                 asyncio.create_task(generation_single_request(task))
 
         except queue.Empty:

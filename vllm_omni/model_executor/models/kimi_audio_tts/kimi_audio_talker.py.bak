@@ -1,0 +1,418 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Kimi-Audio Talker model for TTS generation."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Any
+
+import torch
+import torch.nn as nn
+from transformers import AutoConfig
+from vllm.config import VllmConfig
+from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.models.utils import AutoWeightsLoader, PPMissingLayer, WeightsMapper, maybe_prefix
+from vllm.sequence import IntermediateTensors
+
+from vllm_omni.model_executor.models.output_templates import OmniOutput
+
+from .configuration_kimi_audio_tts import KimiAudioTalkerConfig
+
+logger = init_logger(__name__)
+
+
+class KimiAudioMIMODecoderLayer(nn.Module):
+    """MIMO decoder layer for audio generation path.
+    
+    Same architecture as the shared backbone decoder layers,
+    but used exclusively for the audio generation path after bifurcation.
+    """
+
+    def __init__(self, config: KimiAudioTalkerConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = KimiAudioMIMOAttention(config)
+        
+        # MLP
+        from vllm.model_executor.layers.linear import ColumnParallelLinear, RowParallelLinear
+        from vllm.model_executor.layers.activation import get_act_fn
+        
+        self.mlp = nn.ModuleDict({
+            'gate_proj': ColumnParallelLinear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                gather_output=False,
+            ),
+            'up_proj': ColumnParallelLinear(
+                config.hidden_size,
+                config.intermediate_size,
+                bias=False,
+                gather_output=False,
+            ),
+            'down_proj': RowParallelLinear(
+                config.intermediate_size,
+                config.hidden_size,
+                bias=False,
+                input_is_parallel=True,
+            ),
+        })
+        self.act_fn = get_act_fn(config.hidden_act)
+        
+        # Layer norms
+        from vllm.model_executor.layers.layernorm import RMSNorm
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple | None, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Forward pass for MIMO decoder layer."""
+        residual = hidden_states
+        
+        # Self-attention
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            output_attentions=output_attentions,
+            use_cache=use_cache,
+        )
+        hidden_states = residual + hidden_states
+        
+        # MLP
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # MLP forward
+        gate = self.act_fn(self.mlp['gate_proj'](hidden_states))
+        up = self.mlp['up_proj'](hidden_states)
+        hidden_states = self.mlp['down_proj'](gate * up)
+        
+        hidden_states = residual + hidden_states
+        
+        outputs = (hidden_states,)
+        if output_attentions:
+            outputs += (self_attn_weights,)
+        if use_cache:
+            outputs += (present_key_value,)
+        
+        return outputs
+
+
+class KimiAudioMIMOAttention(nn.Module):
+    """Multi-headed attention for MIMO layers."""
+    
+    def __init__(self, config: KimiAudioTalkerConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        
+        from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+        
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.num_heads,
+            self.num_key_value_heads,
+            bias=True,
+        )
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.head_dim,
+            self.hidden_size,
+            bias=False,
+            input_is_parallel=True,
+        )
+        
+        # RoPE
+        from vllm.model_executor.layers.rotary_embedding import get_rope
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            max_position=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor, torch.Tensor] | None]:
+        """Forward pass for MIMO attention."""
+        bsz, q_len, _ = hidden_states.size()
+        
+        # QKV projection
+        qkv = self.qkv_proj(hidden_states)
+        query_states, key_states, value_states = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim).split(
+            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=2
+        )
+        
+        # Apply RoPE
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        from vllm.model_executor.layers.rotary_embedding import apply_rotary_pos_emb
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        # KV cache
+        if past_key_value is not None:
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        
+        present_key_value = (key_states, value_states) if use_cache else None
+        
+        # GQA: repeat KV heads to match query heads
+        if self.num_key_value_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=2)
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=2)
+        
+        # Scaled dot-product attention
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim ** 0.5)
+        
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+        
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+        attn_output = self.o_proj(attn_output)
+        
+        if not output_attentions:
+            attn_weights = None
+        
+        return attn_output, attn_weights, present_key_value
+
+
+class KimiAudioTalkerForConditionalGeneration(nn.Module):
+    """Kimi-Audio Talker for TTS generation.
+    
+    Architecture:
+    - Shared backbone (layers 0-21): Processes text input
+    - Bifurcation @ layer 21: Clone hidden states for audio path
+    - MIMO layers (0-5): Audio generation path
+    - mimo_output: Projects to audio vocabulary
+    
+    Usage:
+        Set model_stage="kimi_audio_talker" in vllm_config
+    """
+    
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            # Embeddings
+            "model.embed_tokens.": "language_model.model.embed_tokens.",
+            # Backbone layers
+            "model.layers.": "language_model.model.layers.",
+            # Final norm
+            "model.norm.": "language_model.model.norm.",
+            # Text head
+            "lm_head.": "language_model.lm_head.",
+            # MIMO layers
+            "model.mimo_layers.": "mimo_layers.",
+            # MIMO norm
+            "model.mimo_norm.": "mimo_norm.",
+            # Audio output head
+            "model.mimo_output.": "mimo_output.",
+            # VQ-Adaptor (for audio input processing)
+            "model.vq_adaptor.": "vq_adaptor.",
+        }
+    )
+    
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        self.vllm_config = vllm_config
+        self.config: KimiAudioTalkerConfig = vllm_config.model_config.hf_config
+        
+        self.have_multimodal_outputs = True
+        self.has_preprocess = False
+        self.has_postprocess = False
+        
+        # Get model path
+        self.model_path = vllm_config.model_config.model
+        
+        # Initialize language model backbone (Qwen2-style)
+        from vllm.model_executor.models.qwen2 import Qwen2Model
+        from vllm.model_executor.models.utils import init_vllm_registered_model
+        
+        # Create a Qwen2 config from KimiAudio config
+        from transformers import Qwen2Config
+        qwen2_config = Qwen2Config(
+            vocab_size=self.config.vocab_size,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.intermediate_size,
+            num_hidden_layers=self.config.num_hidden_layers,
+            num_attention_heads=self.config.num_attention_heads,
+            num_key_value_heads=self.config.num_key_value_heads,
+            hidden_act=self.config.hidden_act,
+            rms_norm_eps=self.config.rms_norm_eps,
+            rope_theta=self.config.rope_theta,
+            max_position_embeddings=self.config.max_position_embeddings,
+        )
+        
+        # Initialize backbone
+        self.language_model = init_vllm_registered_model(
+            vllm_config=vllm_config.with_hf_config(qwen2_config),
+            prefix=maybe_prefix(prefix, "language_model"),
+        )
+        
+        # MIMO layers for audio generation
+        self.mimo_layers = nn.ModuleList([
+            KimiAudioMIMODecoderLayer(self.config)
+            for _ in range(self.config.mimo_layers)
+        ])
+        
+        # MIMO final norm
+        from vllm.model_executor.layers.layernorm import RMSNorm
+        self.mimo_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+        
+        # Audio output head
+        if get_pp_group().is_last_rank:
+            self.mimo_output = ParallelLMHead(
+                self.config.audio_output_vocab,
+                self.config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "mimo_output"),
+            )
+        else:
+            self.mimo_output = PPMissingLayer()
+        
+        # Logits processor for audio tokens
+        self.logits_processor = LogitsProcessor(self.config.audio_output_vocab)
+        
+        # VQ-Adaptor for audio input (optional, for ASR+TTS unified model)
+        if self.config.use_whisper_feature:
+            self.vq_adaptor = nn.Sequential(
+                nn.Linear(self.config.kimia_adaptor_input_dim, self.config.hidden_size),
+                nn.SiLU(),
+                nn.Dropout(0.0),
+                nn.Linear(self.config.hidden_size, self.config.hidden_size),
+                nn.LayerNorm(self.config.hidden_size, eps=self.config.rms_norm_eps),
+            )
+        
+        self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
+        
+        # Audio token range
+        self.audio_token_offset = self.config.audio_token_offset
+        self.audio_vocab_size = self.config.audio_output_vocab
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Any = None,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Embed input IDs."""
+        return self.language_model.model.embed_tokens(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> torch.Tensor | IntermediateTensors:
+        """Forward pass through backbone and MIMO layers.
+        
+        Args:
+            input_ids: Input token IDs
+            positions: Position IDs
+            intermediate_tensors: For pipeline parallelism
+            inputs_embeds: Input embeddings (optional)
+            
+        Returns:
+            Hidden states from MIMO layers for audio token prediction
+        """
+        # Run through shared backbone
+        hidden_states = self.language_model.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
+        
+        # Store for MIMO path
+        mimo_hidden_states = hidden_states.clone()
+        
+        # Run through MIMO layers
+        for mimo_layer in self.mimo_layers:
+            mimo_hidden_states = mimo_layer(mimo_hidden_states)[0]
+        
+        # Apply final norm
+        mimo_hidden_states = self.mimo_norm(mimo_hidden_states)
+        
+        return mimo_hidden_states
+
+    def compute_logits(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: Any = None,
+    ) -> torch.Tensor | None:
+        """Compute logits for audio tokens.
+        
+        Args:
+            hidden_states: Hidden states from MIMO layers
+            sampling_metadata: Sampling parameters
+            
+        Returns:
+            Logits over audio vocabulary
+        """
+        logits = self.logits_processor(self.mimo_output, hidden_states, sampling_metadata)
+        return logits
+
+    def make_omni_output(
+        self,
+        hidden_states: torch.Tensor,
+        audio_token_ids: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> OmniOutput:
+        """Create OmniOutput with audio codes.
+        
+        Args:
+            hidden_states: Hidden states from MIMO layers
+            audio_token_ids: Generated audio token IDs
+            **kwargs: Additional information
+            
+        Returns:
+            OmniOutput with audio_codes for stage 1
+        """
+        multimodal_outputs = {}
+        
+        if audio_token_ids is not None:
+            multimodal_outputs["audio_codes"] = audio_token_ids
+        
+        return OmniOutput(
+            text_hidden_states=hidden_states,
+            multimodal_outputs=multimodal_outputs,
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load weights including MIMO layers.
+        
+        Unlike the ASR integration, we load ALL weights including:
+        - Backbone layers
+        - MIMO layers
+        - Audio output head
+        - Audio detokenizer (if present)
+        """
+        loader = AutoWeightsLoader(self)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        
+        logger.info(f"Loaded {len(loaded)} weights for KimiAudioTalker")
+        return loaded

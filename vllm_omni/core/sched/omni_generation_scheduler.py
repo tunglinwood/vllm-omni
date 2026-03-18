@@ -486,6 +486,9 @@ class OmniGenerationScheduler(VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                # Transfer pooling_output to next stage via chunk_transfer_adapter
+                if self.chunk_transfer_adapter is not None:
+                    self.chunk_transfer_adapter.save_async(pooler_output, request)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
