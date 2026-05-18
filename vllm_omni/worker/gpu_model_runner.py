@@ -15,6 +15,7 @@ from vllm.sampling_params import SamplingType
 from vllm.tracing import instrument
 from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -1727,3 +1728,51 @@ class OmniGPUModelRunner(GPUModelRunner):
                 merged_info.setdefault("meta", {})["num_processed_tokens"] = 0
                 self.model_intermediate_buffer[req_id] = merged_info
                 setattr(self.requests[req_id], "additional_information_cpu", merged_info)
+
+    def sample_tokens(self, grammar_output):
+        """Override to inject multimodal pooler_output for generation-stage models.
+
+        The base vLLM GPUModelRunner.sample_tokens creates a ModelRunnerOutput
+        with pooler_output=None for generation models. Code2wav and other
+        generation-stage models produce OmniOutput with multimodal_outputs
+        (e.g., {"audio": ..., "sr": ...}) cached in _omni_last_model_output.
+        This override extracts those and populates pooler_output so the
+        scheduler can attach them to EngineCoreOutput.pooling_output.
+        """
+        output = super().sample_tokens(grammar_output)
+
+        # Only handle ModelRunnerOutput (not IntermediateTensors)
+        if not isinstance(output, ModelRunnerOutput):
+            return output
+
+        omni_output = getattr(self, "_omni_last_model_output", None)
+        if not isinstance(omni_output, OmniOutput):
+            return output
+
+        mm_outputs = getattr(omni_output, "multimodal_outputs", None)
+        if not mm_outputs:
+            return output
+
+        # Build pooler_output as list of dicts, matching AR runner format.
+        # Each request gets the full multimodal payload (the output processor
+        # handles accumulation/dedup across steps).
+        req_ids = output.req_ids
+        pooler_output: list[dict[str, object]] = []
+        for _ in req_ids:
+            payload: dict[str, object] = {}
+            for k, v in mm_outputs.items():
+                if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                    # Move each tensor in the list to CPU
+                    payload[k] = [t.detach().to("cpu").contiguous() for t in v]
+                elif isinstance(v, torch.Tensor):
+                    payload[k] = v.detach().to("cpu").contiguous()
+                else:
+                    payload[k] = v
+            pooler_output.append(payload)
+
+        # Only set pooler_output when engine_output_type is not "text"
+        engine_output_type = self.vllm_config.model_config.engine_output_type
+        if engine_output_type != "text":
+            output.pooler_output = pooler_output
+
+        return output

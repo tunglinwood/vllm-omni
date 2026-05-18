@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -606,6 +607,64 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if mm_proc_kw.get("use_audio_in_video", False):
             messages = await self._inject_audio_from_video_urls(messages)
 
+        # OMNI: For Kimi Audio, extract Whisper features from input audio before
+        # rendering. The model was trained with Whisper conditioning and needs
+        # these features for accurate audio generation (S2S) and speech recognition
+        # (ASR). After extraction, we strip audio_url items from messages so the
+        # renderer doesn't try to process them as multimodal data (Kimi Audio is
+        # not registered as a multimodal model in vLLM's registry).
+        request_modalities = (
+            set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
+        )
+        is_s2s_request = request_modalities and "audio" in request_modalities
+
+        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
+        from vllm_omni.model_executor.models.kimia_audio.serving_helpers import (
+            extract_whisper_for_s2s,
+            has_audio_content,
+        )
+
+        if has_audio_content(messages):
+            whisper_emb, raw_audio_info = await extract_whisper_for_s2s(
+                messages,
+                model_dir=self.model_config.model,
+                extract_audio_from_video_async=extract_audio_from_video_async,
+            )
+            logger.info(
+                "[KIMIA DIAG] has_audio=True, whisper_emb=%s, raw_audio=%s, is_s2s=%s",
+                whisper_emb.shape if whisper_emb is not None else None,
+                "yes" if raw_audio_info else "no",
+                is_s2s_request,
+            )
+            # Store on request so it can be passed through to the engine prompt
+            request._whisper_input_feature = whisper_emb  # noqa
+            if raw_audio_info is not None:
+                request._raw_audio_info = raw_audio_info  # noqa
+                # For ASR, also pass raw audio info separately (needed by stage
+                # input processor to reconstruct audio tokens)
+                if not is_s2s_request:
+                    request._asr_audio_info = raw_audio_info  # noqa
+
+            # Strip audio_url items from messages after extraction so the
+            # renderer doesn't crash (Kimi Audio is not a vLLM multimodal model)
+            for msg in messages:
+                content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+                if isinstance(content, list):
+                    new_content = [
+                        part for part in content
+                        if isinstance(part, dict) and part.get("type") not in ("audio_url", "video_url")
+                    ]
+                    # Add a text placeholder indicating audio was received
+                    if whisper_emb is not None:
+                        new_content.append({
+                            "type": "text",
+                            "text": "[Audio input received and processed]"
+                        })
+                    if isinstance(msg, dict):
+                        msg["content"] = new_content
+                    else:
+                        object.__setattr__(msg, "content", new_content)
+
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -672,6 +731,27 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["instruction"] = instructions.strip()
+
+        # OMNI: Pass Whisper features from input audio into the engine prompt
+        # so the Kimi Audio model can condition generation on them.
+        if hasattr(request, "_whisper_input_feature") and request._whisper_input_feature is not None:
+            if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
+                engine_prompt["additional_information"] = {}
+            engine_prompt["additional_information"]["whisper_input_feature"] = request._whisper_input_feature
+            # Also pass raw audio for reference model forward pass
+            if hasattr(request, "_raw_audio_info") and request._raw_audio_info is not None:
+                engine_prompt["additional_information"]["audio_array"] = request._raw_audio_info["audio_array"]
+                engine_prompt["additional_information"]["audio_sample_rate"] = request._raw_audio_info["sample_rate"]
+                # Pass raw 5120-dim Whisper features (pre-VQAdaptor) so the model
+                # can use the HF native forward path (_run_reference_generate_loop)
+                # which matches the reference exactly.
+                if request._raw_audio_info.get("whisper_raw") is not None:
+                    engine_prompt["additional_information"]["whisper_raw"] = request._raw_audio_info["whisper_raw"]
+            # Mark ASR mode: audio input but text-only output (no audio generation).
+            # Kimi-Audio specific: prevents the AR stage from running the audio
+            # code generation loop that's only needed for S2S/TTS.
+            if not is_s2s_request:
+                engine_prompt["additional_information"]["is_asr_mode"] = True
 
         return conversation, [engine_prompt]
 
@@ -848,6 +928,22 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             extra_args["target_h"] = int(height)
             extra_args["target_w"] = int(width)
             params.extra_args = extra_args
+
+        # For audio TTS output, the text path may emit EOS tokens early
+        # (commas, periods, etc.) that would prematurely terminate audio
+        # generation. We need to keep generating audio codes regardless
+        # of text output state.
+        request_modalities = getattr(request, "modalities", None)
+        if request_modalities and "audio" in request_modalities:
+            # Don't stop on text EOS during audio generation
+            params.ignore_eos = True
+            # Default to 1500 decode steps if not explicitly set
+            # (matching reference: ~1500 codes for ~12.5s audio)
+            if params.max_tokens is None or params.max_tokens < 1500:
+                params.max_tokens = 1500
+            # Clear stop tokens to prevent early termination
+            params.stop = []
+            params.stop_token_ids = []
 
         return params
 
@@ -1693,6 +1789,49 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
         )
 
+        # OMNI: For models that produce both text+audio outputs (e.g. Kimi-Audio
+        # S2S-trained models), capture text output for use as audio transcript,
+        # then filter to only return audio since the text path is redundant.
+        # Always prefer audio when available.
+        has_audio_output = any(
+            o.final_output_type == "audio" for o in final_outputs
+        )
+
+        # Extract text from Stage 0 output for use as transcript in audio response.
+        s2s_transcript = ""
+        for omni_out in final_outputs:
+            if omni_out.final_output_type == "text" and omni_out.request_output is not None:
+                req_out = omni_out.request_output
+                comp_out = req_out.outputs[0] if req_out.outputs else None
+                mm_out = getattr(comp_out, "multimodal_output", None)
+                # Priority 1: text_codes from reference generate loop (Kimi-Audio S2S)
+                if mm_out and isinstance(mm_out, dict):
+                    text_codes = mm_out.get("text_codes")
+                    if text_codes is not None and tokenizer is not None:
+                        if isinstance(text_codes, torch.Tensor):
+                            text_codes = text_codes.cpu().tolist()
+                        if isinstance(text_codes, list):
+                            text_codes = [int(t) for t in text_codes if isinstance(t, (int, float))]
+                            if text_codes:
+                                s2s_transcript = tokenizer.decode(text_codes)
+                        elif isinstance(text_codes, int):
+                            s2s_transcript = tokenizer.decode([text_codes])
+                # Clean up noise tokens from decoded transcript
+                if s2s_transcript:
+                    # Strip Kimia special tokens that leak into decoded text
+                    s2s_transcript = re.sub(r'<\|im_kimia_text_\w+\|>', '', s2s_transcript).strip()
+                # Priority 2: fallback to output.text (vLLM detokenizer)
+                if not s2s_transcript:
+                    for out in req_out.outputs:
+                        if getattr(out, "text", None):
+                            s2s_transcript = out.text
+                            break
+                if s2s_transcript:
+                    break
+
+        if has_audio_output:
+            requested_modalities = {"audio"}
+
         for omni_outputs in final_outputs:
             choices_data = []
             if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
@@ -1736,7 +1875,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False, transcript=s2s_transcript)
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:
@@ -2048,13 +2187,19 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return choices, usage, prompt_logprobs, prompt_token_ids, kv_transfer_params
 
     def _create_audio_choice(
-        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False
+        self, omni_outputs: OmniRequestOutput, role: str, request: ChatCompletionRequest, stream: bool = False,
+        transcript: str = "",
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
+        if final_res is None:
+            return choices
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        comp_output = final_res.outputs[0]
+        mm_output = getattr(comp_output, "multimodal_output", None)
+        if not isinstance(mm_output, dict):
+            return choices
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if not audio_data:
@@ -2067,7 +2212,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             audio_tensor = audio_data
         if audio_tensor is None:
             return self._create_error_response("Audio generation completed but no audio was produced.")
-        audio_tensor = audio_tensor.detach().cpu().float().numpy()
+        audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
         # Ensure audio is 1D (flatten if needed)
         if audio_tensor.ndim > 1:
@@ -2107,7 +2252,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             id=audio_id,
             data=audio_base64,
             expires_at=expires_at,
-            transcript="",  # Empty transcript if not available
+            transcript=transcript or "",  # Use provided transcript (S2S text output)
         )
 
         for output in final_res.outputs:

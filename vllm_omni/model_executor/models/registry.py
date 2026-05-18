@@ -206,6 +206,17 @@ _OMNI_MODELS = {
         "modeling_moss_tts_nano",
         "MossTTSNanoForGeneration",
     ),
+    ## kimia_audio (Kimi-Audio TTS)
+    "KimiAudioFusedForConditionalGeneration": (
+        "kimia_audio",
+        "kimia_audio_ar_stage",
+        "KimiaAudioFusedForConditionalGeneration",
+    ),
+    "KimiAudioCode2WavForConditionalGeneration": (
+        "kimia_audio",
+        "kimia_audio_code2wav",
+        "KimiaAudioCode2WavForConditionalGeneration",
+    ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",
         "dynin_omni",

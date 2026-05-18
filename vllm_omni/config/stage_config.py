@@ -1326,7 +1326,13 @@ class StageConfigFactory:
         config_data = load_yaml_config(path)
 
         stages: list[StageConfig] = []
-        for stage_data in config_data.stages:
+        # Support both 'stages' and 'stage_args' top-level keys.
+        # Use explicit 'is None' check so 'stages: []' correctly produces
+        # an empty list rather than falling through to 'stage_args'.
+        stage_list = getattr(config_data, "stages", None)
+        if stage_list is None:
+            stage_list = getattr(config_data, "stage_args", [])
+        for stage_data in stage_list:
             # Use .get() for optional fields — idiomatic for OmegaConf DictConfig
             stage_type_str = stage_data.get("stage_type", "llm")
             stage_type = StageType(stage_type_str) if stage_type_str else StageType.LLM

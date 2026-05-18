@@ -754,6 +754,17 @@ def build_vllm_config(
     if upgraded is not vllm_config.quant_config:
         vllm_config = replace(vllm_config, quant_config=upgraded)
 
+    # For Kimi-Audio models, wrap executor to inject audio codes into sampled output.
+    arch = getattr(vllm_config.model_config, "architectures", None) or []
+    if any("Kimia" in str(a) or "KimiAudio" in str(a) for a in arch):
+        from vllm_omni.model_executor.models.kimia_audio.executor_wrapper import KimiaAudioExecutorWrapper
+
+        executor_class = KimiaAudioExecutorWrapper(executor_class)
+        logger.info(
+            "[stage_init] Using KimiAudio audio executor wrapper for architectures: %s",
+            arch,
+        )
+
     return vllm_config, executor_class
 
 

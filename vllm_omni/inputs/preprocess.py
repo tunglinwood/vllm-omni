@@ -25,6 +25,34 @@ class OmniInputPreprocessor(InputPreprocessor):
     Supports processing tokens, embeddings, text, and multimodal inputs.
     """
 
+    def _tokenize_prompt(
+        self,
+        prompt: str,
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Tokenize text prompt, with fallback for TikTokenTokenizer.
+
+        Some custom tokenizers (e.g. Kimi-Audio's TikTokenTokenizer) don't
+        accept standard kwargs like `truncation` or `add_special_tokens`.
+        Check by name first, then fall back to catching TypeError for
+        unknown tokenizers.
+        """
+        tokenizer = self.get_tokenizer()
+        # Tokenizers like TikTokenTokenizer don't support standard kwargs
+        if "TikToken" in type(tokenizer).__name__:
+            return tokenizer.encode(prompt)
+
+        try:
+            return super()._tokenize_prompt(prompt, tokenization_kwargs)
+        except TypeError as e:
+            if "unexpected keyword argument" in str(e) or "got an unexpected keyword argument" in str(e):
+                logger.debug(
+                    "Tokenizer doesn't support tokenization kwargs, calling directly: %s",
+                    e,
+                )
+                return tokenizer.encode(prompt)
+            raise
+
     def _process_text(
         self,
         parsed_content: OmniTextPrompt,

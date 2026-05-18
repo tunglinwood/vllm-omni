@@ -53,6 +53,10 @@ from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
     create_instruction as ming_create_instruction,
 )
+from vllm_omni.model_executor.models.kimia_audio import (
+    MODEL_STAGE as KIMIA_AUDIO_MODEL_STAGE,
+    TTS_MODEL_TYPE as KIMIA_AUDIO_TTS_MODEL_TYPE,
+)
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
@@ -69,6 +73,7 @@ _VOXCPM2_TTS_MODEL_STAGES = {"latent_generator"}
 _MING_TTS_MODEL_STAGES = {"ming_tts"}
 _MOSS_TTS_MODEL_STAGES = {"moss_tts_nano"}
 _GLM_TTS_MODEL_STAGES = {"glm_tts"}
+_KIMIA_AUDIO_MODEL_STAGES = {KIMIA_AUDIO_MODEL_STAGE}
 _TTS_MODEL_STAGES: set[str] = (
     _VOXTRAL_TTS_MODEL_STAGES
     | _QWEN3_TTS_MODEL_STAGES
@@ -80,6 +85,7 @@ _TTS_MODEL_STAGES: set[str] = (
     | _MING_TTS_MODEL_STAGES
     | _MOSS_TTS_MODEL_STAGES
     | _GLM_TTS_MODEL_STAGES
+    | _KIMIA_AUDIO_MODEL_STAGES
 )
 _SAMPLING_MAX_TOKENS_TTS_MODEL_TYPES = {"fish_tts", "qwen3_tts", "voxtral_tts", "cosyvoice3", "voxcpm2"}
 _TTS_LANGUAGES: set[str] = {
@@ -334,6 +340,15 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
             in _COSYVOICE3_TTS_MODEL_STAGES
         )
+        self._cosyvoice3_tokenizer = None
+
+        self._is_kimia_audio = (
+            self._tts_stage is not None
+            and getattr(getattr(self._tts_stage, "engine_args", None), "model_stage", None)
+            in _KIMIA_AUDIO_MODEL_STAGES
+        )
+
+        self._cosyvoice3_tokenizer = None
         # Determine TTS model type or None
         self._tts_model_type = self._detect_tts_model_type()
 
@@ -507,6 +522,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "moss_tts_nano"
         if model_stage in _GLM_TTS_MODEL_STAGES:
             return "glm_tts"
+        if model_stage in _KIMIA_AUDIO_MODEL_STAGES:
+            return KIMIA_AUDIO_TTS_MODEL_TYPE
         return None
 
     def _compute_max_instructions_length(self) -> int:
@@ -1129,6 +1146,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
     def _validate_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
         """Validate TTS request parameters. Returns error message or None."""
+        if self._tts_model_type == "kimia_audio":
+            return (
+                "TTS is not supported for Kimi-Audio models. "
+                "Use /v1/chat/completions with audio input for speech-to-speech (S2S)."
+            )
         if self._tts_model_type == "voxtral_tts":
             return self._validate_voxtral_tts_request(request)
         if self._tts_model_type == "fish_tts":
@@ -1148,60 +1170,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return self._validate_moss_tts_request(request)
         if self._tts_model_type == "glm_tts":
             return self._validate_glm_tts_request(request)
+        if self._tts_model_type == "kimia_audio":
+            # Kimia Audio: simple validation — just check non-empty input
+            if not request.input or not request.input.strip():
+                return "Input text cannot be empty"
+            return self._validate_kimia_audio_request(request)
         return self._validate_qwen_tts_request(request)
 
-    def _voxcpm2_encode(self, text: str) -> list[int]:
-        """Tokenize text for VoxCPM2, splitting multichar Chinese tokens."""
-        from vllm_omni.model_executor.models.voxcpm2.voxcpm2_talker import (
-            build_cjk_split_map,
-            split_multichar_chinese,
-        )
-
-        if self._voxcpm2_tokenizer is None:
-            from transformers import AutoTokenizer
-
-            model_name = self.engine_client.model_config.model
-            tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-            self._voxcpm2_split_map = build_cjk_split_map(tokenizer)
-            self._voxcpm2_tokenizer = tokenizer
-            logger.info("VoxCPM2 serving: built multichar split map (%d entries)", len(self._voxcpm2_split_map))
-
-        ids = self._voxcpm2_tokenizer.encode(text, add_special_tokens=True)
-        return split_multichar_chinese(ids, self._voxcpm2_split_map)
-
-    def _validate_ming_tts_request(self, request: OpenAICreateSpeechRequest) -> str | None:
-        """Validate Ming-flash-omni standalone-talker request parameters."""
+    def _validate_kimia_audio_request(self, request: OpenAICreateSpeechRequest) -> str | None:
+        """Validate Kimia Audio request parameters. Returns error message or None."""
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
-        if request.instructions is not None:
-            if not isinstance(request.instructions, str):
-                return "instructions must be a string"
-            if len(request.instructions) > self._max_instructions_length:
-                return f"instructions exceeds max length {self._max_instructions_length}"
-
-        if request.task_type is not None:
-            return "'task_type' is not supported for Ming-flash-omni TTS"
-        if request.language is not None:
-            return "'language' is not supported for Ming-flash-omni TTS (language is inferred from input text)"
-        if request.x_vector_only_mode is not None:
-            return "'x_vector_only_mode' is not supported for Ming-flash-omni TTS"
-        if request.initial_codec_chunk_frames is not None:
-            return "'initial_codec_chunk_frames' is not supported for Ming-flash-omni TTS"
-
-        # Per-request voice cloning from raw audio is not yet wired up: Ming
-        # extracts spk_emb / prompt_wav_lat / prompt_wav_emb model-side via
-        # register_prompt_wav() at engine init. For ad-hoc cloning, callers
-        # should pre-compute speaker_embedding and pass it directly.
-        if request.ref_audio is not None:
-            return (
-                "'ref_audio' is not yet supported for Ming-flash-omni TTS; "
-                "use a preset 'voice' or 'speaker_embedding' instead"
-            )
-        if request.ref_text is not None:
-            return "'ref_text' is not yet supported for Ming-flash-omni TTS"
-
-        if request.max_new_tokens is not None and request.max_new_tokens <= 0:
-            return "'max_new_tokens' must be a positive integer"
+        if request.max_new_tokens is not None:
+            if request.max_new_tokens < _TTS_MAX_NEW_TOKENS_MIN:
+                return f"max_new_tokens must be at least {_TTS_MAX_NEW_TOKENS_MIN}"
+            if request.max_new_tokens > _TTS_MAX_NEW_TOKENS_MAX:
+                return f"max_new_tokens cannot exceed {_TTS_MAX_NEW_TOKENS_MAX}"
         return None
 
     def _validate_ref_audio_format(self, ref_audio: str) -> str | None:
@@ -1625,6 +1609,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Processes each parameter if present, skips if not.
         Values are wrapped in lists as required by the model.
         """
+        # Kimia Audio: simple params — no task_type, language, or speaker
+        if self._is_kimia_audio:
+            params: dict[str, Any] = {}
+            params["text"] = [request.input]
+            # max_new_tokens is set via sampling_params in _prepare_speech_generation
+            # but also include in params for model-side access if needed
+            if request.max_new_tokens is not None:
+                params["max_new_tokens"] = [request.max_new_tokens]
+            return params
+
         params: dict[str, Any] = {}
 
         # Text content (always required)
@@ -1705,6 +1699,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # Generation parameters
         if request.max_new_tokens is not None:
             params["max_new_tokens"] = [request.max_new_tokens]
+        elif self._is_kimia_audio:
+            # Reference Kimi-Audio formula: int(12.5 * 120) - prompt_length = 1500 - prompt_length.
+            # 12.5 tokens/sec * 120 sec max = 1500 max audio tokens for a 2-minute prompt.
+            # The actual prompt length is unknown at request-build time, so use a
+            # conservative default that matches the reference's typical range.
+            params["max_new_tokens"] = [1500]
         else:
             params["max_new_tokens"] = [2048]
 
@@ -2195,6 +2195,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     tts_params["seed"] = [sampling_params_list[0].seed]
                 prompt = tokens_input(prompt_token_ids=[1])
                 prompt["additional_information"] = tts_params
+            elif self._is_kimia_audio:
+                # Kimi-Audio TTS is not supported — validation should have caught this above
+                raise ValueError(
+                    "TTS is not supported for Kimi-Audio models. "
+                    "Use /v1/chat/completions with audio input for speech-to-speech (S2S)."
+                )
             else:
                 tts_params = self._build_tts_params(request)
                 # Resolve ref_audio (explicit or auto-set for uploaded voices)
@@ -2249,6 +2255,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             model_type = "moss_tts_nano"
         elif self._tts_model_type == "glm_tts":
             model_type = "glm_tts"
+        elif self._is_kimia_audio:
+            model_type = "kimia_audio"
         elif self._is_tts:
             model_type = tts_params.get("task_type", ["unknown"])[0]
         else:
@@ -2360,6 +2368,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args["qwen3_tts_request_seed"] = request.seed
+
+        # Kimia Audio: reference uses formula int(12.5 * 120) - prompt_length = 1500 - prompt_length.
+        # Apply max_tokens to sampling_params to cap decode length.
+        if self._is_kimia_audio and sampling_params_list:
+            import copy
+
+            sampling_params_list = copy.deepcopy(sampling_params_list)
+            if request.max_new_tokens is not None:
+                sampling_params_list[0].max_tokens = request.max_new_tokens
+            else:
+                # Kimi-Audio generates at ~12.5 audio codes per second of speech.
+                # The reference caps at 1500 codes (120 seconds max).
+                # For TTS, estimate audio length from text: ~2 codes per character
+                # (English: ~15 chars/sec speech * 12.5 codes/sec / 15 chars/sec ≈ 12.5 codes/sec).
+                # Clamp between 50 (minimum) and 1500 (reference max).
+                text_len = len(request.input)
+                max_tokens = max(50, min(1500, int(text_len * 2.0)))
+                sampling_params_list[0].max_tokens = max_tokens
+                logger.info(
+                    "Kimia-Audio max_tokens: text_len=%d, max_tokens=%d (~%.1fs)",
+                    text_len,
+                    max_tokens,
+                    max_tokens / 12.5,
+                )
 
         generator = self.engine_client.generate(
             prompt=prompt,
