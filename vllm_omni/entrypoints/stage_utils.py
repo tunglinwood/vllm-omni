@@ -55,6 +55,7 @@ def set_stage_devices(
             visible_device_list = _parse_device_list(vis)
             device_list = _map_device_list(stage_id, device_list, visible_device_list)
         device_str = ",".join(device_list)
+        logger.info("[Stage-%s] Setting %s=%s", stage_id, env_var, device_str)
         current_omni_platform.set_device_control_env_var(device_str)
         return device_str
 

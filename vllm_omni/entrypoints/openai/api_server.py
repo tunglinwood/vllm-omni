@@ -202,12 +202,17 @@ def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
 
     OMNI: used to override upstream /v1/chat/completions with omni behavior.
     """
+    from fastapi.routing import APIRoute
     routes_to_remove = []
     for route in app.routes:
-        if isinstance(route, Route) and route.path == path:
-            if methods is None or (hasattr(route, "methods") and route.methods & methods):
-                routes_to_remove.append(route)
-
+        if not isinstance(route, (Route, APIRoute)):
+            continue
+        route_path = getattr(route, "path", "")
+        if route_path != path:
+            continue
+        route_methods = getattr(route, "methods", set())
+        if methods is None or (route_methods & methods):
+            routes_to_remove.append(route)
     for route in routes_to_remove:
         app.routes.remove(route)
 
