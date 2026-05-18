@@ -634,6 +634,20 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(self, hidden_states: torch.Tensor | list[torch.Tensor] | OmniOutput) -> dict:
+        # Detect deconstructed OmniOutput from CUDA graph replay.
+        # vLLM's weak_ref_tensors converts NamedTuple to plain tuple during
+        # graph capture. On replay, we get a plain 4-tuple:
+        # (text_hidden_states, multimodal_outputs_dict, intermediate_tensors, next_token_id)
+        if (
+            isinstance(hidden_states, tuple)
+            and not isinstance(hidden_states, OmniOutput)
+            and len(hidden_states) == 4
+            and isinstance(hidden_states[1], dict)
+        ):
+            text_hidden_states = hidden_states[0]
+            multimodal_outputs = hidden_states[1]
+            return text_hidden_states, multimodal_outputs
+
         if (
             hasattr(self.model, "have_multimodal_outputs")
             and self.model.have_multimodal_outputs

@@ -41,6 +41,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
+from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -67,6 +68,32 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
+
+    @torch.inference_mode()
+    def extract_multimodal_outputs(self, hidden_states):
+        """Override to handle OmniOutput deconstructed by CUDA graph replay.
+
+        During CUDA graph capture, vLLM's CUDAGraphWrapper stores the model
+        output and applies weak_ref_tensors. Since OmniOutput is a NamedTuple
+        (tuple subclass), weak_ref_tensors converts it to a plain tuple.
+        On graph replay, the plain tuple is returned instead of OmniOutput,
+        causing the parent class to misinterpret it as a list of hidden states.
+
+        This method detects the 4-element OmniOutput tuple pattern and recovers
+        the multimodal outputs correctly.
+        """
+        # Detect deconstructed OmniOutput: (text_hs, multimodal_dict, inter, next_tok)
+        if (
+            isinstance(hidden_states, tuple)
+            and len(hidden_states) == 4
+            and isinstance(hidden_states[1], dict)
+        ):
+            text_hidden_states = hidden_states[0]
+            multimodal_outputs = hidden_states[1]
+            return text_hidden_states, multimodal_outputs
+
+        # Fall back to parent class behavior
+        return super().extract_multimodal_outputs(hidden_states)
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests

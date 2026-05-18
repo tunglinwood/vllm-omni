@@ -1268,16 +1268,26 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
         # Flatten and filter valid codes.
         # Input codes come from the AR stage with token_offset added (152064-168447 range).
         # We need to subtract the offset to get the actual audio codes [0, 16383].
-        codes = input_ids.reshape(-1).to(dtype=torch.long).cpu()
+        # During warmup (graph capture), input_ids are small dummy values.
+        # Use value range check to distinguish warmup from real inference.
+        num_codes = input_ids.shape[0]
+        is_warmup = num_codes <= 2 and input_ids.max() < 10
 
-        # Warmup detection (codes with value 0 or very low values)
-        warmup_mask = codes < self._token_offset
-        is_warmup = warmup_mask.all().item()
+        if is_warmup:
+            # Return dummy waveform immediately — avoid any .cpu() or .item() during capture
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
+            )
 
-        if not is_warmup:
-            # Subtract token offset from audio codes
+        codes = input_ids.reshape(-1).to(dtype=torch.long)
+        # Audio codes may come from the AR stage in either format:
+        # 1. With offset: [152064, 168447] (full token IDs)
+        # 2. Without offset: [0, 16383] (audio code indices from audio_logits sampling)
+        # Detect which format by checking if values are in the audio vocab range.
+        if codes.min() >= self._token_offset:
             codes = codes - self._token_offset
-
+        codes = codes.cpu()
         valid_mask = (codes >= 0) & (codes < self._audio_vocab_size)
         valid_codes = codes[valid_mask]
 
@@ -1441,11 +1451,37 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
         """Wrap raw model outputs into OmniOutput format."""
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
+
+        # Handle deconstructed OmniOutput from CUDA graph replay.
+        # vLLM's weak_ref_tensors converts NamedTuple to plain tuple during
+        # graph capture. On replay, we get a plain 4-tuple:
+        # (text_hidden_states, multimodal_outputs_dict, intermediate_tensors, next_token_id)
+        if isinstance(model_outputs, (tuple, list)) and len(model_outputs) == 4:
+            text_hs = model_outputs[0]
+            mm_out = model_outputs[1]
+            if isinstance(mm_out, dict):
+                return OmniOutput(
+                    text_hidden_states=text_hs,
+                    multimodal_outputs=mm_out,
+                )
+
         if isinstance(model_outputs, torch.Tensor):
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": model_outputs},
             )
+
+        # Handle other tuple/list outputs (e.g., from wrapped forward calls)
+        if isinstance(model_outputs, (tuple, list)):
+            # If it contains OmniOutput, return it directly
+            for item in model_outputs:
+                if isinstance(item, OmniOutput):
+                    return item
+            return OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={"model_outputs": [model_outputs]},
+            )
+
         raise TypeError(
             f"KimiaAudioCode2Wav expected tensor or OmniOutput, got {type(model_outputs)}",
         )
