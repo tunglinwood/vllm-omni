@@ -1268,13 +1268,11 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
         # Flatten and filter valid codes.
         # Input codes come from the AR stage with token_offset added (152064-168447 range).
         # We need to subtract the offset to get the actual audio codes [0, 16383].
-        # During warmup (graph capture), input_ids are small dummy values.
-        # Use value range check to distinguish warmup from real inference.
         num_codes = input_ids.shape[0]
-        is_warmup = num_codes <= 2 and input_ids.max() < 10
+        is_profile_run = num_codes > 1000
 
-        if is_warmup:
-            # Return dummy waveform immediately — avoid any .cpu() or .item() during capture
+        if is_profile_run:
+            # Skip heavy DiT/vocoder during memory profiling runs
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
@@ -1284,9 +1282,8 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
         # Audio codes may come from the AR stage in either format:
         # 1. With offset: [152064, 168447] (full token IDs)
         # 2. Without offset: [0, 16383] (audio code indices from audio_logits sampling)
-        # Detect which format by checking if values are in the audio vocab range.
-        if codes.min() >= self._token_offset:
-            codes = codes - self._token_offset
+        # Use torch.where for graph-compatible conditional offset subtraction.
+        codes = torch.where(codes >= self._token_offset, codes - self._token_offset, codes)
         codes = codes.cpu()
         valid_mask = (codes >= 0) & (codes < self._audio_vocab_size)
         valid_codes = codes[valid_mask]
@@ -1297,12 +1294,6 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
             valid_codes.numel(),
             self._audio_vocab_size,
         )
-        if valid_codes.numel() > 0:
-            logger.info(
-                "Kimia-Audio code2wav: valid codes range [%d, %d]",
-                valid_codes.min().item(),
-                valid_codes.max().item(),
-            )
 
         if valid_codes.numel() == 0:
             return OmniOutput(
@@ -1310,25 +1301,13 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
-        # Detect warmup inputs (all-zero codes) and skip heavy DiT/vocoder
-        if valid_codes.numel() > 1 and valid_codes.max().item() == 0:
-            logger.debug("Kimia-Audio code2wav: warmup detected (all-zero codes), returning dummy")
-            # Return a short dummy waveform for warmup handshake
-            dummy_len = self._output_sample_rate  # 1 second of silence
-            dummy_waveform = torch.zeros(dummy_len, dtype=torch.float32)
-            return OmniOutput(
-                text_hidden_states=None,
-                multimodal_outputs={"model_outputs": [dummy_waveform], "sr": [sr_tensor]},
-            )
-
         device = self.vllm_config.device_config.device
         audio_codes = valid_codes.unsqueeze(0).to(device)
         _, t_len = audio_codes.shape
 
         logger.info(
-            "Kimia-Audio code2wav: audio_codes shape=%s, min=%d, max=%d, unique=%d",
-            list(audio_codes.shape), audio_codes.min().item(),
-            audio_codes.max().item(), audio_codes.unique().numel(),
+            "Kimia-Audio code2wav: audio_codes shape=%s, count=%d",
+            list(audio_codes.shape), audio_codes.numel(),
         )
 
         # Step 1+2: DiT generates mel + vocoder decodes to waveform with overlap smoothing

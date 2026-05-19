@@ -16,6 +16,7 @@ Architecture (from weight inspection of Kimi-Audio-7B-Instruct):
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator, Iterable
 from typing import Any
 
@@ -940,6 +941,8 @@ class KimiaAudioFusedForConditionalGeneration(
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
         is_decode: bool = False,
+        text_input_ids: torch.Tensor | None = None,
+        is_continuous_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Combine text and audio embeddings from dual-stream token inputs.
 
@@ -1006,137 +1009,138 @@ class KimiaAudioFusedForConditionalGeneration(
             return audio_embed + text_embed
 
         # Prefill path: construct parallel audio+text embeddings.
-        # The reference model (modeling_kimia.py:672-721) expects TWO token
-        # streams at the SAME positions:
-        #   1. audio_emb = embed_tokens(input_ids) — blank audio tokens
-        #   2. whisper_emb = vq_adaptor(whisper_features) — audio features
-        #   3. text_emb = embed_tokens(text_input_ids) — text tokens
-        # Combined: inputs_embeds = audio_emb + text_emb
-        # where audio_emb = (audio_embed + whisper_emb) * sqrt(2) at masked positions.
-        #
-        # CRITICAL: The audio and text have the SAME sequence length.
-        # vLLM-Omni previously CONCATENATED them ([audio, text]) which the model
-        # was NOT trained on — causing severe audio quality degradation.
-        # Fix: SUM audio+text embeddings at each position, using max length.
+        # Match the reference model (modeling_moonshot_kimia.py:705-759):
+        #   1. audio_emb = embed_tokens(input_ids) — uses actual token IDs
+        #   2. Find media_begin/media_end positions in input_ids
+        #   3. Place whisper features at positions media_start+1 .. media_end
+        #   4. (audio_emb + whisper) * sqrt(2) at masked positions
+        #   5. Keep original audio_emb at wrapper positions
+        #   6. inputs_embeds = audio_emb + embed_tokens(text_input_ids)
 
-        text_embed = embed_tokens(input_ids)
-        text_len = input_ids.shape[-1]
+        # Squeeze batch dimension if present — vLLM may pass [1, seq] or [seq]
+        if input_ids.dim() == 2:
+            input_ids = input_ids.squeeze(0)
+        if text_input_ids is not None and text_input_ids.dim() == 2:
+            text_input_ids = text_input_ids.squeeze(0)
+        if is_continuous_mask is not None and is_continuous_mask.dim() == 2:
+            is_continuous_mask = is_continuous_mask.squeeze(0)
+
+        # Step 1: Embed actual audio token IDs (including wrappers)
+        audio_emb = embed_tokens(input_ids)  # [seq_len, 3584]
+        seq_len = audio_emb.shape[0]
+
+        # Step 2: Embed text token IDs
+        if text_input_ids is not None and text_input_ids.numel() > 0:
+            text_emb = embed_tokens(text_input_ids)  # [text_len, 3584]
+        else:
+            text_emb = None
+
+        # Profile/warmup run: no is_continuous_mask provided — skip Whisper injection
+        if is_continuous_mask is None:
+            self._prefill_audio_offset = seq_len
+            return audio_emb if text_emb is None else audio_emb + text_emb
 
         # Priority 1: Per-request Whisper features from input audio
         if self._input_whisper_emb is not None:
             # _input_whisper_emb: [1, audio_frames, 3584] — already post-VQAdaptor
-            whisper_emb = self._input_whisper_emb.squeeze(0).to(
-                text_embed.device, dtype=text_embed.dtype,
+            whisper_3584 = self._input_whisper_emb.squeeze(0).to(
+                audio_emb.device, dtype=audio_emb.dtype,
             )  # [audio_frames, 3584]
-            audio_frames = whisper_emb.shape[0]
+            audio_frames = whisper_3584.shape[0]
 
-            # Create audio placeholder tokens and embed
-            audio_blank_index = 18  # relative audio token index
-            audio_ids = torch.full(
-                (audio_frames,), audio_blank_index + token_offset,
-                device=input_ids.device, dtype=input_ids.dtype,
-            )
-            audio_embed = embed_tokens(audio_ids)  # [audio_frames, 3584]
+            # Step 2: Find media boundaries in input_ids (1D tensor)
+            media_begin = int(self.config.kimia_media_begin)  # 151661
+            media_end = int(self.config.kimia_media_end)      # 151663
 
-            # Audio path: (audio_embed + whisper) * sqrt(2) — matching reference
-            audio_combined = (audio_embed + whisper_emb) * (2.0 ** 0.5)
+            media_start_pos = (input_ids == media_begin).nonzero(as_tuple=True)[0]
+            media_end_pos = (input_ids == media_end).nonzero(as_tuple=True)[0]
 
-            # Parallel combination: sum audio+text at each position.
-            # Pad shorter stream with zeros to match lengths.
-            seq_len = max(audio_frames, text_len)
-            if audio_frames < seq_len:
-                audio_padded = torch.cat([
-                    audio_combined,
-                    torch.zeros(seq_len - audio_frames, audio_combined.shape[-1],
-                                device=audio_combined.device, dtype=audio_combined.dtype),
-                ], dim=0)
-            else:
-                audio_padded = audio_combined
-            if text_len < seq_len:
-                text_padded = torch.cat([
-                    text_embed,
-                    torch.zeros(seq_len - text_len, text_embed.shape[-1],
-                                device=text_embed.device, dtype=text_embed.dtype),
-                ], dim=0)
-            else:
-                text_padded = text_embed
-            combined = audio_padded + text_padded  # [seq_len, 3584]
+            # Step 3: Create expanded whisper features [seq_len, 3584] — zeros everywhere
+            expanded_whisper = torch.zeros(seq_len, audio_emb.shape[-1],
+                                           device=audio_emb.device, dtype=audio_emb.dtype)
+
+            # Place whisper features at positions media_start+1 .. media_end for each segment
+            for seg_idx in range(len(media_start_pos)):
+                start_pos = media_start_pos[seg_idx].item()
+                end_pos = media_end_pos[seg_idx].item()
+                feat_len = end_pos - (start_pos + 1)
+                if feat_len > 0:
+                    expanded_whisper[start_pos + 1: end_pos, :] = whisper_3584[:feat_len, :]
+
+            # Step 4: Apply mask and combine (matching reference exactly)
+            is_continuous_mask_3d = is_continuous_mask.to(audio_emb.dtype).unsqueeze(-1)  # [seq_len, 1]
+            whisper_masked = expanded_whisper * is_continuous_mask_3d  # zero out non-audio positions
+
+            # (audio_emb + whisper) * sqrt(2) at ALL positions (whisper is zero where masked)
+            encoder_input = (audio_emb + whisper_masked) * (2.0 ** 0.5)
+
+            # Keep original audio_emb at non-masked positions, use combined at masked positions
+            audio_emb = (audio_emb * (~is_continuous_mask_3d.to(torch.bool)) +
+                         encoder_input * is_continuous_mask_3d.to(torch.bool))
 
             # Store for position override in forward()
-            self._prefill_audio_offset = audio_frames
-
-            # [DIAG STEP2] Log combined embeddings
-            logger.info(
-                "[DIAG STEP2] Combined embed (PARALLEL Whisper): audio_frames=%d, text_tokens=%d, "
-                "combined_seq_len=%d (was %d with concat), audio_combined mean=%.4f std=%.4f, "
-                "text_embed mean=%.4f std=%.4f",
-                audio_frames, text_len, combined.shape[0],
-                audio_frames + text_len,  # what concat would have been
-                audio_combined.float().mean().item(), audio_combined.float().std().item(),
-                text_embed.float().mean().item(), text_embed.float().std().item(),
-            )
+            self._prefill_audio_offset = seq_len
 
             # Store whisper features for decode augmentation.
             if getattr(self, '_decode_whisper_frames', None) is None:
-                self._decode_whisper_frames = whisper_emb.clone()  # [audio_frames, 3584]
+                self._decode_whisper_frames = whisper_3584.clone()  # [audio_frames, 3584]
             if getattr(self, '_decode_whisper_template', None) is None:
-                self._decode_whisper_template = whisper_emb.mean(dim=0, keepdim=True).clone()
+                self._decode_whisper_template = whisper_3584.mean(dim=0, keepdim=True).clone()
 
-            return combined
+            # Final combination: audio_emb + text_emb (matching reference line 757)
+            result = audio_emb + text_emb
+
+            # DIAG: Save embedding output for comparison
+            if os.environ.get("KIMIA_DIAG_EMBED", "0") == "1":
+                torch.save(result.detach().cpu(), "/tmp/vllm_embed_output.pt")
+                logger.info("[DIAG EMBED] Saved vLLM embedding output to /tmp/vllm_embed_output.pt")
+
+            return result
 
         # Priority 2: Static Whisper embedding from reference audio (S2S)
         if self._whisper_emb is not None:
-            # _whisper_emb: [1, audio_frames, 3584] — use per-frame features
-            whisper_emb = self._whisper_emb.squeeze(0).to(
-                text_embed.device, dtype=text_embed.dtype,
+            whisper_3584 = self._whisper_emb.squeeze(0).to(
+                audio_emb.device, dtype=audio_emb.dtype,
             )  # [audio_frames, 3584]
-            audio_frames = whisper_emb.shape[0]
+            audio_frames = whisper_3584.shape[0]
 
-            audio_blank_index = 18  # relative audio token index
-            audio_ids = torch.full(
-                (audio_frames,), audio_blank_index + token_offset,
-                device=input_ids.device, dtype=input_ids.dtype,
-            )
-            audio_embed = embed_tokens(audio_ids)
-            audio_combined = (audio_embed + whisper_emb) * (2.0 ** 0.5)
+            # Find media boundaries in input_ids (1D tensor)
+            media_begin = int(self.config.kimia_media_begin)
+            media_end = int(self.config.kimia_media_end)
 
-            # Parallel: sum at each position
-            seq_len = max(audio_frames, text_len)
-            if audio_frames < seq_len:
-                audio_padded = torch.cat([
-                    audio_combined,
-                    torch.zeros(seq_len - audio_frames, audio_combined.shape[-1],
-                                device=audio_combined.device, dtype=audio_combined.dtype),
-                ], dim=0)
-            else:
-                audio_padded = audio_combined
-            if text_len < seq_len:
-                text_padded = torch.cat([
-                    text_embed,
-                    torch.zeros(seq_len - text_len, text_embed.shape[-1],
-                                device=text_embed.device, dtype=text_embed.dtype),
-                ], dim=0)
-            else:
-                text_padded = text_embed
-            combined = audio_padded + text_padded
+            media_start_pos = (input_ids == media_begin).nonzero(as_tuple=True)[0]
+            media_end_pos = (input_ids == media_end).nonzero(as_tuple=True)[0]
 
-            self._prefill_audio_offset = audio_frames
+            # Place whisper features at correct positions
+            expanded_whisper = torch.zeros(seq_len, audio_emb.shape[-1],
+                                           device=audio_emb.device, dtype=audio_emb.dtype)
+            for seg_idx in range(len(media_start_pos)):
+                start_pos = media_start_pos[seg_idx].item()
+                end_pos = media_end_pos[seg_idx].item()
+                feat_len = end_pos - (start_pos + 1)
+                if feat_len > 0:
+                    expanded_whisper[start_pos + 1: end_pos, :] = whisper_3584[:feat_len, :]
 
-            # Store whisper features for decode augmentation (cyclic)
+            # Apply mask and combine
+            is_continuous_mask_3d = is_continuous_mask.to(audio_emb.dtype).unsqueeze(-1)
+            whisper_masked = expanded_whisper * is_continuous_mask_3d
+            encoder_input = (audio_emb + whisper_masked) * (2.0 ** 0.5)
+            audio_emb = (audio_emb * (~is_continuous_mask_3d.to(torch.bool)) +
+                         encoder_input * is_continuous_mask_3d.to(torch.bool))
+
+            self._prefill_audio_offset = seq_len
+
             if getattr(self, '_decode_whisper_frames', None) is None:
-                self._decode_whisper_frames = whisper_emb.clone()  # [audio_frames, 3584]
+                self._decode_whisper_frames = whisper_3584.clone()
             if getattr(self, '_decode_whisper_template', None) is None:
-                self._decode_whisper_template = whisper_emb.mean(dim=0, keepdim=True).clone()
+                self._decode_whisper_template = whisper_3584.mean(dim=0, keepdim=True).clone()
 
-            return combined
+            return audio_emb + text_emb
 
         # Fallback — audio placeholders only (warmup, profile, no Whisper features).
         # Used during model warmup/profile runs when no Whisper features are available.
-        self._prefill_audio_offset = 0
-        audio_blank_index = 18  # relative audio token index
-        audio_placeholder_ids = torch.full_like(input_ids, audio_blank_index + token_offset)
-        audio_embed = embed_tokens(audio_placeholder_ids)
-        return audio_embed + text_embed
+        self._prefill_audio_offset = seq_len
+        return audio_emb if text_emb is None else audio_emb + text_emb
 
     def forward(
         self,
@@ -1160,27 +1164,14 @@ class KimiaAudioFusedForConditionalGeneration(
         # Detect prefill vs decode phase
         is_prefill = input_ids is not None and input_ids.dim() > 0 and input_ids.shape[-1] > 1
 
-        # Detect warmup/dummy runs using shape + value range checks (graph-compatible).
-        # Real decode produces valid token IDs >= 100. Warmup uses tiny dummy values
-        # (typically 0-5). We use max() comparison which is graph-safe (no .item()).
+        # Profile run detection only (large sequences for memory profiling).
+        # Graph capture and real inference use the SAME forward path —
+        # vLLM models have NO warmup detection in their forward methods.
         _seq_len = input_ids.shape[-1] if input_ids is not None and input_ids.dim() > 0 else 0
-        _is_dummy_values = (
-            input_ids is not None
-            and input_ids.dim() > 0
-            and input_ids.max() < 10
-        )
-        is_warmup = _seq_len <= 2 and _is_dummy_values
         is_profile_run = _seq_len > 1000
 
-        if is_profile_run or is_warmup:
-            logger.info(
-                "[DIAG DETECT] %s: is_prefill=%s, seq_len=%d",
-                "PROFILE" if is_profile_run else "WARMUP",
-                is_prefill, _seq_len,
-            )
-
         # Reset state at start of new request (prefill)
-        if is_prefill and not is_warmup:
+        if is_prefill:
             self._decode_step_counter = 0
             self._audio_codes_list = []
             self._audio_code_cap_logged = False
@@ -1200,7 +1191,7 @@ class KimiaAudioFusedForConditionalGeneration(
             self._extract_whisper_from_kwargs(kwargs)
 
         # DIAGNOSTIC: Log audio code self-feedback during decode (graph-compatible)
-        if not is_prefill and not is_warmup and input_ids is not None:
+        if not is_prefill and not is_profile_run and input_ids is not None:
             if self._diag_decode_log_count < 50:
                 self._diag_decode_log_count += 1
                 logger.info(
@@ -1214,11 +1205,15 @@ class KimiaAudioFusedForConditionalGeneration(
         is_decode = not is_prefill
 
         if get_pp_group().is_first_rank:
-            hidden_states = self._combine_audio_text_embeds(input_ids, inputs_embeds, is_decode=is_decode)
+            hidden_states = self._combine_audio_text_embeds(
+                input_ids, inputs_embeds, is_decode=is_decode,
+                text_input_ids=kwargs.get("text_input_ids"),
+                is_continuous_mask=kwargs.get("is_continuous_mask"),
+            )
             residual = None
 
             # Override positions for parallel combined sequence during prefill
-            if is_prefill and not is_warmup and getattr(self, '_prefill_audio_offset', 0) > 0:
+            if is_prefill and getattr(self, '_prefill_audio_offset', 0) > 0:
                 audio_offset = self._prefill_audio_offset
                 _text_len = input_ids.shape[-1]
                 full_seq_len = max(audio_offset, _text_len)
@@ -1226,31 +1221,17 @@ class KimiaAudioFusedForConditionalGeneration(
                 if hidden_states.dim() == 3 and positions.dim() == 1:
                     positions = positions.unsqueeze(0)
 
-                if not is_warmup:
-                    logger.info(
-                        "[DIAG POS] Prefill position override (PARALLEL): audio_offset=%d, text_len=%d, "
-                        "full_seq_len=%d, positions=[%d..%d]",
-                        audio_offset, _text_len, full_seq_len,
-                        positions.min().item(), positions.max().item(),
-                    )
-
             # Store prefill sequence length for decode position offset
-            if is_prefill and not is_warmup:
+            if is_prefill:
                 _text_len_for_seq = input_ids.shape[-1]
                 self._prefill_seq_len = max(getattr(self, '_prefill_audio_offset', 0), _text_len_for_seq)
                 self._prefill_text_len = _text_len_for_seq
-                if not is_warmup:
-                    logger.info(
-                        "[DIAG SEQLEN] Stored for decode: prefill_seq_len=%d, prefill_text_len=%d, delta=%d",
-                        self._prefill_seq_len, self._prefill_text_len,
-                        self._prefill_seq_len - self._prefill_text_len,
-                    )
             elif not is_prefill and getattr(self, '_prefill_seq_len', 0) > 0:
                 pos_delta = self._prefill_seq_len - self._prefill_text_len
                 positions = positions + pos_delta
 
-            # DIAG: Log embedded input during decode (graph-compatible)
-            if not is_prefill and not is_warmup and self._diag_decode_log_count <= 50:
+            # DIAG: Log embedded input during decode
+            if not is_prefill and not is_profile_run and self._diag_decode_log_count <= 50:
                 logger.info(
                     "DIAG decode embed#%d: shape=%s",
                     self._diag_decode_log_count,
@@ -1268,12 +1249,26 @@ class KimiaAudioFusedForConditionalGeneration(
         num_layers = len(self.layers)
         end_layer = num_layers if get_pp_group().is_last_rank else bifurcation_idx + 1
 
-        if is_warmup or is_profile_run:
-            # Warmup/Profile: skip layers — dummy run needs shapes only
+        # DIAG: Dump hidden_states right before first layer call
+        if not is_profile_run:
+            _hs = hidden_states.float()
+            logger.info(
+                "[DIAG HS-PRE] hidden_states pre-layer: shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
+                list(_hs.shape), _hs.mean().item(), _hs.std().item(), _hs.min().item(), _hs.max().item(),
+            )
+            # Per-position stats for first 5 and last 3
+            for i in [0, 1, 2, 25, 50, 51, 52]:
+                if i < _hs.shape[0]:
+                    pos = _hs[i]
+                    logger.info("[DIAG HS-PRE]   pos[%d]: mean=%.6f std=%.6f", i, pos.mean().item(), pos.std().item())
+            # Save for comparison
+            torch.save(hidden_states.detach().cpu(), "/tmp/vllm_hs_pre_layer.pt")
+
+        if is_profile_run:
+            # Profile: skip layers — dummy run needs shapes only
             seq_len = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
             mimo_hidden_states = hidden_states.clone() if get_pp_group().is_last_rank else None
-            run_type = "WARMUP" if is_warmup else "PROFILE"
-            logger.info("[DIAG %s] Skipping backbone layers (seq_len=%d)", run_type, seq_len)
+            logger.info("[DIAG PROFILE] Skipping backbone layers (seq_len=%d)", seq_len)
         elif get_pp_group().is_first_rank or (not get_pp_group().is_first_rank and not get_pp_group().is_last_rank):
             # Run backbone layers up to bifurcation point (or all on first rank for non-PP)
             for idx in range(0, end_layer):
@@ -1305,8 +1300,8 @@ class KimiaAudioFusedForConditionalGeneration(
 
         # Run MIMO layers
         if mimo_hidden_states is not None:
-            if is_warmup or is_profile_run:
-                logger.info("[DIAG %s] Skipping MIMO layers", "PROFILE" if is_profile_run else "WARMUP")
+            if is_profile_run:
+                logger.info("[DIAG PROFILE] Skipping MIMO layers")
             else:
                 mimo_residual = None
                 for i, mimo_layer in enumerate(self.mimo_layers):
@@ -1342,7 +1337,7 @@ class KimiaAudioFusedForConditionalGeneration(
             )
 
             # Accumulate audio codes
-            if is_warmup:
+            if is_profile_run:
                 self._audio_codes = torch.empty(0, dtype=torch.long)
                 self._text_codes = torch.empty(0, dtype=torch.long)
                 multimodal_outputs = {"audio_codes": None, "text_codes": None}
@@ -1503,8 +1498,18 @@ class KimiaAudioFusedForConditionalGeneration(
         # Concatenate stacked shards and load
         for mapped_name, shards in stacked_shards.items():
             param = model_params[mapped_name]
-            key = mapped_name.split(".")[-1]  # e.g., "qkv_proj" or "gate_up_proj"
-            order = {"qkv_proj": ["q", "k", "v"], "gate_up_proj": ["0", "1"]}.get(key, sorted(shards.keys()))
+            # Extract the layer type from the mapped name.
+            # mapped_name is like "layers.0.self_attn.qkv_proj.bias" — we need "qkv_proj"
+            parts = mapped_name.split(".")
+            if len(parts) >= 2:
+                key = parts[-2]  # e.g., "qkv_proj" or "gate_up_proj"
+            else:
+                key = parts[-1]
+            default_order = {"qkv_proj": ["q", "k", "v"], "gate_up_proj": ["0", "1"]}
+            if key in default_order:
+                order = default_order[key]
+            else:
+                order = sorted(shards.keys())
             sorted_shards = [shards[k] for k in order if k in shards]
             if sorted_shards:
                 concat_weight = torch.cat(sorted_shards, dim=0)

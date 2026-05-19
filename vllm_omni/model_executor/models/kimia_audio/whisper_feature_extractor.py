@@ -28,16 +28,16 @@ logger = init_logger(__name__)
 class VQAdaptor(nn.Module):
     """Projects Whisper features (5120-dim) to Kimi-Audio hidden space (3584-dim).
 
-    Architecture: Linear[5120->3584] -> GELU -> Linear[3584->3584] -> LayerNorm[3584]
+    Architecture: Linear[5120->3584] -> SiLU -> Linear[3584->3584] -> LayerNorm[3584]
     """
 
     def __init__(self, input_dim: int = 5120, hidden_dim: int = 3584):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.LayerNorm(hidden_dim, eps=1e-6),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
