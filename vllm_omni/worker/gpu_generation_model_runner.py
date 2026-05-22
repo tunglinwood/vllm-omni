@@ -355,7 +355,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                clear_metadata=not defer_kv_connector_finalize,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
@@ -804,7 +804,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions.gpu[:num_tokens_padded]
+                positions = self.positions[:num_tokens_padded]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None

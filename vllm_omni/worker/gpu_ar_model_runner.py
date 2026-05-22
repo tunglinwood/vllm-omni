@@ -586,7 +586,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                clear_metadata=not defer_kv_connector_finalize,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(
