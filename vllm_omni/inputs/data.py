@@ -63,7 +63,7 @@ class OmniTokensPrompt(TokensPrompt):
 class OmniTokenInputs(TokensInput):
     """Token inputs with optional embeddings and additional information.
 
-    Extends TokensInput to support prompt embeddings and additional
+    Extends TokenInputs to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:

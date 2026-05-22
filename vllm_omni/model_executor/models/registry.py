@@ -210,12 +210,12 @@ _OMNI_MODELS = {
     "KimiAudioFusedForConditionalGeneration": (
         "kimia_audio",
         "kimia_audio_ar_stage",
-        "KimiaAudioFusedForConditionalGeneration",
+        "KimiAudioFusedForConditionalGeneration",
     ),
     "KimiAudioCode2WavForConditionalGeneration": (
         "kimia_audio",
         "kimia_audio_code2wav",
-        "KimiaAudioCode2WavForConditionalGeneration",
+        "KimiAudioCode2WavForConditionalGeneration",
     ),
     "DyninOmniForConditionalGeneration": (
         "dynin_omni",

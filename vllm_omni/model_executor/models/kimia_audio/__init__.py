@@ -4,19 +4,19 @@
 
 Provides model classes for Kimi-Audio TTS pipeline:
 - KimiaAudioFusedForConditionalGeneration: AR stage (text -> audio codes)
-- KimiaAudioCode2WavForConditionalGeneration: code2wav stage (audio codes -> waveform)
+- KimiAudioCode2WavForConditionalGeneration: code2wav stage (audio codes -> waveform)
 """
 
 from vllm_omni.model_executor.models.kimia_audio.kimia_audio_ar_stage import (
-    KimiaAudioFusedForConditionalGeneration,
+    KimiAudioFusedForConditionalGeneration,
 )
 from vllm_omni.model_executor.models.kimia_audio.kimia_audio_code2wav import (
-    KimiaAudioCode2WavForConditionalGeneration,
+    KimiAudioCode2WavForConditionalGeneration,
 )
 
 __all__ = [
-    "KimiaAudioFusedForConditionalGeneration",
-    "KimiaAudioCode2WavForConditionalGeneration",
+    "KimiAudioFusedForConditionalGeneration",
+    "KimiAudioCode2WavForConditionalGeneration",
     "MODEL_STAGE",
     "TTS_MODEL_TYPE",
 ]

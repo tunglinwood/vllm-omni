@@ -1,16 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Kimia Audio AR stage: HF backbone + MIMO bifurcation for S2S.
+"""Kimia Audio AR stage: S2S model extending vLLM upstream with MIMO layers.
 
 This module implements the fused_thinker_talker stage for Kimi-Audio S2S (speech-to-speech).
-It uses reference HuggingFace Transformers backbone and MIMO layers for
-exact numerical match with the Kimi-Audio implementation.
+It inherits from vLLM upstream's ASR model and adds MIMO layers for audio generation.
 
-Architecture (from weight inspection of Kimi-Audio-7B-Instruct):
-- Qwen2-7B backbone: 28 layers, hidden=3584, heads=28, kv_heads=4 (GQA with bias)
-- MIMO bifurcation: hidden states cloned after layer 21
-- MIMO branch: 6 decoder layers + RMSNorm + linear head (168448 vocab)
-- Unified vocab: 168448 = 152064 text + 16384 audio tokens (offset 152064)
+Architecture:
+- Inherits from vLLM upstream: Whisper encoder, VQAdaptor, embeddings, 28-layer backbone, lm_head
+- Adds: 6 MIMO decoder layers branching at layer 21, mimo_norm, mimo_output (audio head)
+- Fixes: VQAdaptor GELU → SiLU (upstream bug, reference uses SiLU)
 """
 
 from __future__ import annotations
@@ -23,19 +21,20 @@ from typing import Any
 import numpy as np
 import torch
 from transformers import Qwen2Config
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.distributed import get_pp_group
 from vllm.inputs import TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models import SupportsPP
 from vllm.model_executor.models.interfaces import SupportsRealtime
+from vllm.model_executor.models.kimi_audio import (
+    KimiAudioForConditionalGeneration,
+    KimiAudioMultiModalProjector,
+    KimiAudioWhisperEncoder,
+)
 from vllm.model_executor.models.qwen2 import Qwen2DecoderLayer
 from vllm.model_executor.models.utils import make_layers
 from vllm.sequence import IntermediateTensors
@@ -44,8 +43,6 @@ from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 logger = init_logger(__name__)
-
-
 
 
 def _sample_audio_topk(
@@ -151,7 +148,11 @@ class KimiaRealtimeBuffer:
         self,
         whisper_extractor: Any,
     ) -> AsyncGenerator[TokensPrompt, None]:
-        """Yield TokensPrompt with Whisper features as audio segments accumulate."""
+        """Yield TokensPrompt with Whisper features as audio segments accumulate.
+
+        Uses a custom WhisperFeatureExtractor for backward compatibility.
+        Prefer get_input_stream_with_tower for new code.
+        """
         while True:
             chunk = await self._audio_queue.get()
             if chunk is None:
@@ -196,34 +197,110 @@ class KimiaRealtimeBuffer:
                 },
             )
 
+    async def get_input_stream_with_tower(
+        self,
+        audio_tower: KimiAudioWhisperEncoder,
+        projector: KimiAudioMultiModalProjector,
+        sampling_rate: int = 16000,
+    ) -> AsyncGenerator[TokensPrompt, None]:
+        """Yield TokensPrompt with Whisper features using upstream audio_tower + projector.
 
-class KimiaAudioFusedForConditionalGeneration(
-    torch.nn.Module,
-    SupportsPP,
+        This replaces the custom WhisperFeatureExtractor path with vLLM upstream's
+        KimiAudioWhisperEncoder for feature extraction.
+        """
+        while True:
+            chunk = await self._audio_queue.get()
+            if chunk is None:
+                self._ended = True
+                break
+
+            self._accumulated.append(chunk)
+            self._total_samples += len(chunk)
+
+            if self._total_samples >= self._segment_samples:
+                full_audio = np.concatenate(self._accumulated)
+                segment = full_audio[: self._segment_samples]
+                remainder = full_audio[self._segment_samples :]
+
+                # Extract Whisper features using upstream audio_tower + projector
+                # (same as upstream _process_audio_input, but for raw audio)
+                with torch.no_grad():
+                    audio_tensor = torch.from_numpy(segment).float().cuda()
+                    # audio_tower expects list of tensors (Mel spectrogram features)
+                    # For raw audio, we use the HF processor to get Mel features
+                    audio_features = audio_tower([audio_tensor])
+
+                    # 4x downsample (same as upstream _process_audio_input)
+                    B, T, D = audio_features.shape
+                    if T % 4 != 0:
+                        pad_len = 4 - (T % 4)
+                        audio_features = torch.nn.functional.pad(audio_features, (0, 0, 0, pad_len))
+                        T = audio_features.shape[1]
+                    audio_features = audio_features.reshape(B, T // 4, D * 4)
+
+                    # Project to LLM dimension
+                    whisper_emb = projector(audio_features)
+
+                yield TokensPrompt(
+                    prompt_token_ids=[],
+                    mm_processor_kwargs={
+                        "whisper_input_feature": whisper_emb,
+                    },
+                )
+
+                if len(remainder) > 0:
+                    self._accumulated = [remainder]
+                    self._total_samples = len(remainder)
+                else:
+                    self._accumulated = []
+                    self._total_samples = 0
+
+        if self._total_samples > 0:
+            full_audio = np.concatenate(self._accumulated)
+            with torch.no_grad():
+                audio_tensor = torch.from_numpy(full_audio).float().cuda()
+                audio_features = audio_tower([audio_tensor])
+                B, T, D = audio_features.shape
+                if T % 4 != 0:
+                    pad_len = 4 - (T % 4)
+                    audio_features = torch.nn.functional.pad(audio_features, (0, 0, 0, pad_len))
+                    T = audio_features.shape[1]
+                audio_features = audio_features.reshape(B, T // 4, D * 4)
+                whisper_emb = projector(audio_features)
+            yield TokensPrompt(
+                prompt_token_ids=[],
+                mm_processor_kwargs={
+                    "whisper_input_feature": whisper_emb,
+                },
+            )
+
+
+class KimiAudioFusedForConditionalGeneration(
+    KimiAudioForConditionalGeneration,
     CustomProcessMixin,
     SupportsRealtime,
 ):
-    """Fused thinker-talker for Kimi-Audio S2S.
+    """Kimi-Audio model with MIMO layers for speech-to-speech generation.
 
-    Uses vLLM's Qwen2 backbone for both text and audio feature extraction,
-    with 6 MIMO decoder layers that branch off at layer 21 for audio generation.
+    Inherits from vLLM upstream's ASR model (Whisper, VQAdaptor, embeddings,
+    backbone, lm_head) and adds:
+    - 6 MIMO decoder layers branching at layer 21
+    - Audio output head (mimo_output)
+    - S2S dual-stream embedding with Whisper injection
+    - Fixed VQAdaptor activation (GELU -> SiLU)
 
-    Architecture (matching reference Kimi-Audio):
-    - Backbone: Qwen2 28 layers → backbone norm → lm_head → text logits
-    - MIMO branch: 6 layers (from layer 21) + RMSNorm + mimo_output → audio logits
-
-    The MIMO layers use vLLM's Qwen2DecoderLayer for weight compatibility
-    with the original checkpoint (FlashAttn attention + SiLU-gated MLP +
-    2 RMSNorms).
-
-    NOTE: vLLM v1's GPU-based sampler does NOT support the executor's
-    audio code injection into the feedback loop (sample_tokens doesn't
-    exist in v1). Instead, we accumulate audio codes generated across
-    all forward passes (prefill + decode) into a single sequence.
+    The S2S-specific embedding construction and forward pass override the
+    upstream ASR-only implementations.
     """
 
     realtime_max_tokens = 128
     """Maximum audio code tokens to generate per streaming audio segment."""
+
+    enforce_eager = True
+    prefer_model_sampler = True
+    """Use model's sample() method for audio code sampling outside CUDA graph."""
+    requires_raw_input_tokens = True
+    """Pass input_ids to forward() alongside inputs_embeds for Whisper injection."""
 
     @classmethod
     async def buffer_realtime_audio(
@@ -234,67 +311,95 @@ class KimiaAudioFusedForConditionalGeneration(
     ) -> AsyncGenerator[TokensPrompt, None]:
         """Buffer streaming audio and yield TokensPrompt with Whisper features.
 
-        Receives raw audio chunks from the realtime endpoint, accumulates them
-        into segments, extracts Whisper features, and yields TokensPrompt for
-        each segment. The engine generates audio codes which are streamed back
-        via input_stream (not yet consumed by this buffer — codes go directly
-        to code2wav stage).
-
-        Args:
-            audio_stream: Async generator yielding numpy audio chunks.
-            input_stream: Queue for receiving generated tokens (unused here,
-                codes flow to code2wav via the pipeline).
-            model_config: Model configuration (unused, kept for protocol).
-
-        Yields:
-            TokensPrompt with whisper_input_feature in mm_processor_kwargs.
+        Uses vLLM upstream's KimiAudioWhisperEncoder for feature extraction,
+        not a custom WhisperFeatureExtractor.
         """
-        # Lazy import to avoid loading Whisper at module import time
-        from vllm_omni.model_executor.models.kimia_audio.whisper_feature_extractor import (
-            WhisperFeatureExtractor as RuntimeExtractor,
-        )
+        from vllm.config import VllmConfig
 
         sampling_rate = 16000
-        segment_duration_s = 5.0  # Low-latency: process every 5 seconds
+        segment_duration_s = 5.0
 
         buffer = KimiaRealtimeBuffer(
             sampling_rate=sampling_rate,
             segment_duration_s=segment_duration_s,
         )
 
-        # Feed audio into buffer in background
         async def feed_audio():
             async for chunk in audio_stream:
                 await buffer.append_audio(chunk)
-            await buffer.append_audio(None)  # signal end
+            await buffer.append_audio(None)
 
         audio_task = asyncio.create_task(feed_audio())
 
-        # Load Whisper extractor for feature extraction
-        model_dir = model_config.model.rstrip("/")
-        whisper_path = f"{model_dir}/whisper-large-v3"
+        # Build upstream audio_tower + projector for realtime extraction
+        torch.set_default_dtype(torch.bfloat16)
+        vllm_config = VllmConfig(model_config=model_config)
+        vllm_config.model_config.multimodal_config = None  # minimal config, we build manually
+
+        # Reuse upstream's KimiAudioWhisperEncoder
+        audio_tower = KimiAudioWhisperEncoder(
+            vllm_config=vllm_config,
+            prefix="audio_tower",
+        )
+        audio_tower = audio_tower.cuda().bfloat16()
+        audio_tower.eval()
+
+        # Reuse upstream's KimiAudioMultiModalProjector
+        projector = KimiAudioMultiModalProjector(
+            whisper_dim=getattr(model_config.hf_config, "kimia_adaptor_input_dim", 5120),
+            llm_dim=model_config.hf_config.hidden_size,
+            prefix="multi_modal_projector",
+        )
+        projector = projector.cuda().bfloat16()
+        projector.eval()
+
+        # Apply SiLU fix (same as _fix_vq_adaptor_activation)
+        def silu_forward(audio_features):
+            hidden = projector.vq_adaptor_layers_0(audio_features)
+            hidden = torch.nn.functional.silu(hidden)
+            hidden = projector.vq_adaptor_layers_3(hidden)
+            hidden = projector.vq_adaptor_layers_4(hidden)
+            return hidden
+
+        projector.forward = silu_forward
+
+        # Load weights from shards
+        from safetensors.torch import load_file  # noqa: I001
         import glob
-        import os
-        vq_shard_path = None
-        shards = glob.glob(os.path.join(model_dir, "model-*-of-*.safetensors"))
-        for shard in sorted(shards):
-            from safetensors.torch import load_file
-            ckpt = load_file(shard)
-            if any("vq_adaptor" in k for k in ckpt.keys()):
-                vq_shard_path = shard
-                break
 
-        if vq_shard_path is None:
-            logger.error("VQAdaptor shard not found for realtime Whisper extraction")
-            return
+        model_dir = model_config.model.rstrip("/")
+        shards = sorted(glob.glob(os.path.join(model_dir, "model-*-of-*.safetensors")))
+        all_weights = []
+        for shard_path in shards:
+            ckpt = load_file(shard_path)
+            all_weights.extend(ckpt.items())
 
-        extractor = RuntimeExtractor(
-            whisper_model_path=whisper_path,
-            vq_adaptor_shard_path=vq_shard_path,
+        # Map weight names for audio_tower and projector
+        from vllm.model_executor.models.kimi_audio import (
+            KimiAudioForConditionalGeneration as UpstreamKimiAudio,
         )
 
+        mapper = UpstreamKimiAudio.hf_to_vllm_mapper
+        for name, weight in all_weights:
+            mapped = name
+            if mapper:
+                for orig, new in mapper.orig_to_new_prefix.items():
+                    if name.startswith(orig):
+                        mapped = new + name[len(orig) :]
+                        break
+            if mapped.startswith("audio_tower.") or mapped.startswith("multi_modal_projector."):
+                # Find matching param and copy weight
+                for param_name, param in list(audio_tower.named_parameters()) + list(projector.named_parameters()):
+                    if param_name == mapped:
+                        param.data.copy_(weight)
+                        break
+
         try:
-            async for tokens_prompt in buffer.get_input_stream(extractor):
+            async for tokens_prompt in buffer.get_input_stream_with_tower(
+                audio_tower,
+                projector,
+                sampling_rate=sampling_rate,
+            ):
                 yield tokens_prompt
         finally:
             audio_task.cancel()
@@ -304,18 +409,28 @@ class KimiaAudioFusedForConditionalGeneration(
         vllm_config: VllmConfig,
         prefix: str = "",
     ) -> None:
-        super().__init__()
+        # Ensure multimodal_config is set — the upstream class's
+        # _mark_tower_model context manager requires it. For S2S,
+        # Whisper features are passed via additional_information,
+        # but the upstream still creates the audio tower.
+        if vllm_config.model_config.multimodal_config is None:
+            from vllm.config import MultiModalConfig
 
-        # Get config from vllm_config which was already loaded by vLLM.
-        self.config = vllm_config.model_config.hf_config
+            object.__setattr__(
+                vllm_config.model_config,
+                "multimodal_config",
+                MultiModalConfig(),
+            )
+
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
+        # Fix VQAdaptor: GELU -> SiLU (upstream bug, reference uses SiLU)
+        self._fix_vq_adaptor_activation()
+
+        # Store vllm_config for MIMO layer initialization
         self.vllm_config = vllm_config
         self.cache_config = vllm_config.cache_config
         self.quant_config = vllm_config.quant_config
-
-        # Patch rope_theta onto config for transformers 5.8+ compatibility.
-        if not hasattr(self.config, 'rope_theta'):
-            rope_params = getattr(self.config, 'rope_parameters', {})
-            self.config.rope_theta = rope_params.get('rope_theta', 1000000.0)
 
         # Fix incorrect kimia_audio_output_vocab in the checkpoint config
         expected_audio_vocab = int(getattr(self.config, "kimia_token_offset", 152064))
@@ -332,8 +447,9 @@ class KimiaAudioFusedForConditionalGeneration(
             )
             self.config.kimia_audio_output_vocab = correct_audio_vocab
 
-        # Build Qwen2Config matching Kimi-Audio parameters for vLLM decoder layers
-        rope_theta = getattr(self.config, 'rope_theta', None) or self.config.rope_parameters.get('rope_theta', 1000000.0)
+        # Build Qwen2Config matching Kimi-Audio parameters for MIMO decoder layers
+        rope_theta = getattr(self.config, "rope_theta", None)
+        rope_theta = rope_theta or self.config.rope_parameters.get("rope_theta", 1_000_000.0)
         self._qwen2_config = Qwen2Config(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.intermediate_size,
@@ -345,47 +461,12 @@ class KimiaAudioFusedForConditionalGeneration(
             rope_theta=rope_theta,
             num_hidden_layers=self.config.num_hidden_layers,
         )
-        # Ensure rope_parameters exists for vLLM's Qwen2Attention
-        if not hasattr(self._qwen2_config, 'rope_parameters') or self._qwen2_config.rope_parameters is None:
+        if not hasattr(self._qwen2_config, "rope_parameters") or self._qwen2_config.rope_parameters is None:
             self._qwen2_config.rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
-        # Ensure hidden_act exists (Qwen2MLP requires it)
-        if not hasattr(self._qwen2_config, 'hidden_act') or self._qwen2_config.hidden_act is None:
+        if not hasattr(self._qwen2_config, "hidden_act") or self._qwen2_config.hidden_act is None:
             self._qwen2_config.hidden_act = "silu"
 
-        # Embedding layer
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.embed_tokens",
-        )
-
-        # Backbone: 28x Qwen2DecoderLayer (vLLM-native, CUDA-graph compatible)
-        num_backbone_layers = self.config.num_hidden_layers  # 28
-        self.start_layer, self.end_layer, self.layers = make_layers(
-            num_backbone_layers,
-            lambda prefix: Qwen2DecoderLayer(
-                config=self._qwen2_config,
-                cache_config=self.cache_config,
-                quant_config=self.quant_config,
-                prefix=prefix,
-            ),
-            prefix=f"{prefix}.layers",
-        )
-
-        # Backbone norm
-        self.norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-
-        # Text output head
-        self.lm_head = ParallelLMHead(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.lm_head",
-        )
-
-        # MIMO branch: 6x Qwen2DecoderLayer (vLLM-native, CUDA-graph compatible)
-        # These branch off at layer 21 (kimia_mimo_transformer_from_layer_index)
+        # MIMO branch: 6 Qwen2DecoderLayer branching off backbone at layer 21
         num_mimo_layers = 6
         _, _, self.mimo_layers = make_layers(
             num_mimo_layers,
@@ -398,9 +479,8 @@ class KimiaAudioFusedForConditionalGeneration(
             prefix=f"{prefix}.mimo_layers",
         )
 
-        # MIMO norm and output head (simple linear, not ParallelLMHead which requires sampler)
+        # MIMO norm and output head
         self.mimo_norm = RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-        from vllm.model_executor.layers.linear import ReplicatedLinear
         self.mimo_output = ReplicatedLinear(
             self.config.hidden_size,
             self.config.vocab_size,
@@ -409,10 +489,8 @@ class KimiaAudioFusedForConditionalGeneration(
             prefix=f"{prefix}.mimo_output",
         )
 
-        # Bifurcation point: hidden states are cloned after this layer index
-        self._bifurcation_layer = int(
-            getattr(self.config, "kimia_mimo_transformer_from_layer_index", 21)
-        )
+        # Bifurcation point: hidden states cloned after this layer index
+        self._bifurcation_layer = int(getattr(self.config, "kimia_mimo_transformer_from_layer_index", 21))
 
         # Logits processor for text generation path
         self.logits_processor = LogitsProcessor(
@@ -421,8 +499,6 @@ class KimiaAudioFusedForConditionalGeneration(
 
         # Track decode steps for delay token application
         self._decode_step_counter: int = 0
-        self._diag_decode_log_count: int = 0
-        self._diag_log_step: int = 0
 
         # Accumulated audio codes across prefill + decode steps
         self._audio_codes_list: list[torch.Tensor] = []
@@ -434,12 +510,6 @@ class KimiaAudioFusedForConditionalGeneration(
         self._max_audio_codes: int = int(
             getattr(self.config, "kimia_max_audio_codes", 3000),
         )
-        self._audio_code_cap_logged: bool = False
-
-        # Whisper embedding for reference audio (TTS mode)
-        self._whisper_emb: torch.Tensor | None = None
-        self._speaker_emb: torch.Tensor | None = None
-        self._load_whisper_embedding()
 
         # Per-request Whisper features from user input audio (S2S mode)
         self._input_whisper_emb: torch.Tensor | None = None
@@ -450,240 +520,52 @@ class KimiaAudioFusedForConditionalGeneration(
         self._asr_text_hidden_states: torch.Tensor | None = None
         self._asr_text_seq_len: int = 0
 
-        # Lazy-loaded Whisper feature extractor for runtime extraction
-        self._whisper_extractor: Any | None = None
-
         # Mark model as having multimodal outputs
         self.have_multimodal_outputs = True
 
+        # Access backbone layers via upstream's language_model
+        # These are Qwen2DecoderLayer instances created by vLLM upstream
+        self.layers = self.language_model.model.layers
+        self.start_layer = getattr(self.language_model.model, "start_layer", 0)
+        self.end_layer = getattr(self.language_model.model, "end_layer", len(self.layers))
+        self.norm = self.language_model.model.norm
+
         logger.info(
-            "KimiAudio vLLM-native model initialized: %d backbone layers + %d MIMO layers, "
+            "KimiaS2S model initialized: vLLM upstream backbone (%d layers) + %d MIMO layers, "
             "bifurcation at layer %d, vocab=%d",
-            num_backbone_layers, num_mimo_layers, self._bifurcation_layer, self.config.vocab_size,
+            len(self.layers),
+            num_mimo_layers,
+            self._bifurcation_layer,
+            self.config.vocab_size,
         )
 
-    def get_input_embeddings(self) -> torch.nn.Embedding:
-        return self.embed_tokens
-
-    def _load_whisper_embedding(self) -> None:
-        """Load pre-extracted Whisper embedding from reference audio."""
-        import os
-        whisper_path = os.path.join(
-            os.path.dirname(__file__), "whisper_embedding.pt"
-        )
-        if not os.path.exists(whisper_path):
-            logger.warning(
-                "Whisper embedding not found at %s, using placeholder audio embeddings. "
-                "Run extract_whisper_embedding.py to generate it.",
-                whisper_path,
-            )
+    def _fix_vq_adaptor_activation(self):
+        """Fix upstream's GELU -> SiLU in VQAdaptor to match reference model."""
+        if not hasattr(self, "multi_modal_projector"):
+            return
+        projector = self.multi_modal_projector
+        if not hasattr(projector, "vq_adaptor_layers_0"):
             return
 
-        try:
-            data = torch.load(whisper_path, map_location="cpu", weights_only=True)
-            # whisper_emb: [1, seq_len, 3584] — keep the full temporal sequence
-            # The model was trained with temporal Whisper features, so using
-            # the full sequence (interpolated to match text token count) provides
-            # phonetic/phonetic content guidance, not just voice characteristics.
-            whisper_emb = data["whisper_emb"]
-            # Also store a mean-pooled speaker embedding for decode phase
-            speaker_emb = whisper_emb.mean(dim=1, keepdim=True)  # [1, 1, 3584]
-            self._whisper_emb = whisper_emb  # [1, seq_len, 3584]
-            self._speaker_emb = speaker_emb  # [1, 1, 3584]
-            logger.info(
-                "Loaded Whisper embedding from reference audio: temporal shape %s, "
-                "speaker embedding %s",
-                list(whisper_emb.shape),
-                list(speaker_emb.shape),
-            )
-        except Exception as e:
-            logger.warning("Failed to load Whisper embedding: %s", e)
+        def silu_forward(audio_features):
+            hidden = projector.vq_adaptor_layers_0(audio_features)
+            hidden = torch.nn.functional.silu(hidden)
+            hidden = projector.vq_adaptor_layers_3(hidden)
+            hidden = projector.vq_adaptor_layers_4(hidden)
+            return hidden
 
-    def _get_whisper_extractor(self) -> Any | None:
-        """Lazy-load Whisper feature extractor for runtime audio processing.
-
-        Returns None if the required model paths are not available.
-        """
-        if self._whisper_extractor is not None:
-            return self._whisper_extractor
-
-        try:
-            import os
-
-            from vllm_omni.model_executor.models.kimia_audio.whisper_feature_extractor import (
-                WhisperFeatureExtractor as RuntimeExtractor,
-            )
-
-            # Locate the whisper-large-v3 subfolder next to the checkpoint
-            model_dir = self.vllm_config.model_config.model
-            whisper_path = os.path.join(model_dir, "whisper-large-v3")
-            if not os.path.isdir(whisper_path):
-                logger.warning(
-                    "Whisper model not found at %s, speech-to-speech "
-                    "feature extraction disabled",
-                    whisper_path,
-                )
-                return None
-
-            # VQAdaptor weights are in the last shard
-            vq_shard_path = os.path.join(model_dir, "model-35-of-35.safetensors")
-            if not os.path.isfile(vq_shard_path):
-                # Try to find any shard containing vq_adaptor
-                import glob
-                shards = glob.glob(os.path.join(model_dir, "model-*-of-*.safetensors"))
-                for shard in sorted(shards):
-                    from safetensors.torch import load_file
-                    ckpt = load_file(shard)
-                    if any("vq_adaptor" in k for k in ckpt.keys()):
-                        vq_shard_path = shard
-                        break
-                else:
-                    logger.warning("VQAdaptor shard not found, speech-to-speech disabled")
-                    return None
-
-            self._whisper_extractor = RuntimeExtractor(
-                whisper_model_path=whisper_path,
-                vq_adaptor_shard_path=vq_shard_path,
-            )
-            # Trigger lazy init
-            _ = self._whisper_extractor.vq_adaptor
-            logger.info("Whisper feature extractor initialized")
-            return self._whisper_extractor
-        except Exception as e:
-            logger.warning("Failed to initialize Whisper extractor: %s", e)
-            return None
-
-    def _get_reference_whisper_encoder(self) -> Any | None:
-        """Lazy-load reference Kimi-Audio WhisperEncoder for S2S feature extraction.
-
-        This uses the SAME WhisperEncoder as the reference prompt_manager,
-        ensuring identical Whisper features for S2S audio generation.
-
-        Returns None if the Kimi-Audio package is not available.
-        """
-        if hasattr(self, "_ref_whisper_encoder"):
-            return self._ref_whisper_encoder
-
-        self._ref_whisper_encoder = None  # cache miss sentinel
-        try:
-            import os
-            import sys
-            # Ensure Kimi-Audio package is importable
-            kimia_path = "/root/learning/Kimi-Audio"
-            if kimia_path not in sys.path:
-                sys.path.insert(0, kimia_path)
-
-            from kimia_infer.models.tokenizer.whisper_Lv3.whisper import (
-                WhisperEncoder,
-            )
-
-            model_dir = self.vllm_config.model_config.model
-            whisper_path = os.path.join(model_dir, "whisper-large-v3")
-            if not os.path.isdir(whisper_path):
-                logger.warning(
-                    "Reference Whisper model not found at %s, "
-                    "falling back to vLLM extractor",
-                    whisper_path,
-                )
-                return None
-
-            logger.info("Loading reference WhisperEncoder from %s...", whisper_path)
-            ref_encoder = WhisperEncoder(whisper_path, mel_batch_size=20)
-            ref_encoder = ref_encoder.to(torch.cuda.current_device())
-            ref_encoder = ref_encoder.bfloat16()
-            ref_encoder.eval()
-
-            self._ref_whisper_encoder = ref_encoder
-            logger.info("Reference WhisperEncoder loaded successfully")
-            return ref_encoder
-        except Exception as e:
-            logger.warning("Failed to initialize reference WhisperEncoder: %s", e)
-            return None
-
-    def _extract_reference_whisper_features(
-        self, audio_array: np.ndarray, sample_rate: int = 16000
-    ) -> torch.Tensor | None:
-        """Extract Whisper features using reference Kimi-Audio WhisperEncoder.
-
-        Pipeline: waveform -> reference WhisperEncoder.tokenize_waveform -> [1, seq, 1280]
-        Then 4x downsample + VQAdaptor -> [1, seq//4, 3584]
-
-        Args:
-            audio_array: Raw audio waveform (numpy array, 16kHz mono).
-            sample_rate: Sample rate (default 16000).
-
-        Returns:
-            Whisper embedding tensor [1, seq_len, 3584] or None on failure.
-        """
-        ref_encoder = self._get_reference_whisper_encoder()
-        if ref_encoder is None:
-            return None
-
-        try:
-            # Convert to torch tensor if needed
-            if isinstance(audio_array, np.ndarray):
-                audio_tensor = torch.from_numpy(audio_array).float()
-            else:
-                audio_tensor = audio_array
-
-            # Resample to 16kHz if needed
-            if sample_rate != 16000:
-                import librosa
-                audio_np = audio_tensor.cpu().numpy()
-                audio_np = librosa.resample(audio_np, orig_sr=sample_rate, target_sr=16000)
-                audio_tensor = torch.from_numpy(audio_np).float()
-
-            # Get encoder output [1, encoder_frames, 1280]
-            with torch.no_grad():
-                encoder_output = ref_encoder(audio_tensor.unsqueeze(0))
-
-            # 4x downsample + VQAdaptor (reuse vLLM's VQAdaptor logic)
-            whisper_extractor = self._get_whisper_extractor()
-            if whisper_extractor is None:
-                logger.warning("VQAdaptor not available for reference Whisper features")
-                return None
-
-            # Downsample: concatenate every 4 consecutive frames
-            batch_size, seq_len, hidden_dim = encoder_output.shape
-            trunc_len = (seq_len // 4) * 4
-            if trunc_len != seq_len:
-                encoder_output = encoder_output[:, :trunc_len, :]
-            downsampled = encoder_output.view(
-                batch_size, trunc_len // 4, hidden_dim * 4
-            )  # [B, seq//4, 5120]
-
-            # VQAdaptor projection
-            whisper_emb = whisper_extractor.vq_adaptor(downsampled)  # [1, seq//4, 3584]
-
-            logger.info(
-                "Reference Whisper features: %d samples -> %d encoder frames "
-                "-> %d downsampled -> output %s",
-                audio_tensor.shape[0], seq_len, trunc_len // 4, list(whisper_emb.shape),
-            )
-            return whisper_emb
-        except Exception as e:
-            logger.warning("Failed to extract reference Whisper features: %s", e)
-            return None
+        projector.forward = silu_forward
 
     def _extract_whisper_from_kwargs(self, kwargs: dict[str, Any]) -> None:
         """Extract Whisper features from kwargs passed by the vLLM engine.
 
-        The serving layer puts ``whisper_input_feature`` in
-        ``engine_prompt["additional_information"]``.  The engine serializes
-        this into ``model_intermediate_buffer``, which arrives as a list of
-        per-request dicts in kwargs.
-
-        Supports three modes:
-        1. Direct tensor: kwargs["whisper_input_feature"] -> torch.Tensor [1, seq, 3584]
-        2. model_intermediate_buffer: list of dicts containing whisper_input_feature
-        3. Audio array: kwargs["audio_array"] -> numpy array (extract features at runtime)
+        For S2S serving: runner provides pre-extracted 5120-dim Whisper features.
+        We store them as _input_whisper_emb; _combine_audio_text_embeds applies
+        the multi_modal_projector (VQAdaptor) to get 3584-dim features.
         """
-        # Mode 0: Always store raw audio array if present (needed for reference model).
-        # Do this FIRST before Mode 1/2 return early.
-        # Check both top-level kwargs and inside model_intermediate_buffer.
+        # Store raw audio array if present (for diagnostics)
         audio_array = kwargs.get("audio_array")
         if audio_array is None:
-            # Also check inside model_intermediate_buffer
             buffer = kwargs.get("model_intermediate_buffer")
             if buffer is not None and isinstance(buffer, list) and buffer:
                 first_entry = buffer[0]
@@ -691,250 +573,208 @@ class KimiaAudioFusedForConditionalGeneration(
                     audio_array = first_entry.get("audio_array")
                     sample_rate = first_entry.get("audio_sample_rate")
                     if audio_array is not None and sample_rate is not None:
-                        kwargs["audio_sample_rate"] = sample_rate  # Make available below
+                        kwargs["audio_sample_rate"] = sample_rate
 
         if audio_array is not None:
-            if isinstance(audio_array, (list, tuple)):
-                # Handle nested/irregular lists from serialization
+            if isinstance(audio_array, (list, tuple)):  # noqa: UP038
                 flat = []
                 for item in audio_array:
-                    if isinstance(item, (list, tuple)):
+                    if isinstance(item, (list, tuple)):  # noqa: UP038
                         flat.extend(item)
                     else:
                         flat.append(item)
                 audio_array = np.array(flat, dtype=np.float32)
             elif isinstance(audio_array, np.ndarray):
-                # Already a numpy array from deserialization
                 if audio_array.dtype != np.float32:
                     audio_array = audio_array.astype(np.float32)
                 audio_array = audio_array.reshape(-1)
-            elif hasattr(audio_array, 'shape') and len(getattr(audio_array, 'shape', ())) > 1:
+            elif hasattr(audio_array, "shape") and len(getattr(audio_array, "shape", ())) > 1:
                 audio_array = audio_array.reshape(-1).astype(np.float32)
             self._audio_array = audio_array
             self._audio_sample_rate = kwargs.get("audio_sample_rate", 16000)
-            if not self._input_whisper_emb_logged:
-                logger.info(
-                    "[DIAG STEP0] Stored raw audio array: shape=%s sample_rate=%d",
-                    audio_array.shape if hasattr(audio_array, 'shape') else len(audio_array),
-                    self._audio_sample_rate,
-                )
 
-        # ASR mode check: extract BEFORE any early returns (Modes 1/2/3 return).
-        # Passed via engine_prompt["additional_information"]["is_asr_mode"].
-        # Check top-level kwargs, model_intermediate_buffer, and runtime_additional_information.
+        # ASR mode check
         is_asr = kwargs.get("is_asr_mode")
-        _diag_kw_keys = list(kwargs.keys()) if hasattr(kwargs, 'keys') else type(kwargs).__name__
-        logger.info("[DIAG ASR] kwargs keys=%s", _diag_kw_keys)
         if is_asr is None:
             buffer = kwargs.get("model_intermediate_buffer")
             if isinstance(buffer, list) and buffer and isinstance(buffer[0], dict):
                 is_asr = buffer[0].get("is_asr_mode")
-                logger.info("[DIAG ASR] buffer[0] keys=%s, is_asr_mode=%s", list(buffer[0].keys()), is_asr)
-            else:
-                logger.info("[DIAG ASR] buffer type=%s, len=%d", type(buffer).__name__, len(buffer) if isinstance(buffer, (list, tuple)) else 0)
         if is_asr is None:
             runtime_info = kwargs.get("runtime_additional_information")
             if isinstance(runtime_info, dict):
                 is_asr = runtime_info.get("is_asr_mode")
-                logger.info("[DIAG ASR] runtime_additional_information keys=%s, is_asr_mode=%s, full=%s",
-                           list(runtime_info.keys()) if hasattr(runtime_info, 'keys') else type(runtime_info).__name__, is_asr, runtime_info)
             elif isinstance(runtime_info, list) and runtime_info:
                 is_asr = runtime_info[0].get("is_asr_mode") if isinstance(runtime_info[0], dict) else None
-                logger.info("[DIAG ASR] runtime_additional_information[0] type=%s, keys=%s, is_asr_mode=%s",
-                           type(runtime_info[0]).__name__, list(runtime_info[0].keys()) if isinstance(runtime_info[0], dict) else None, is_asr)
-            else:
-                logger.info("[DIAG ASR] runtime_additional_information type=%s, value=%s", type(runtime_info).__name__, runtime_info)
         if is_asr is not None:
             self._is_asr_mode = bool(is_asr)
-            logger.info("[DIAG STEP1y] is_asr_mode=%s (extracted early)", self._is_asr_mode)
-        else:
-            logger.warning("[DIAG ASR] is_asr_mode NOT FOUND in any location")
 
-        # Mode 1: Pre-extracted Whisper features at top level of kwargs
+        # Mode 1: Pre-extracted Whisper features or Mel spectrograms at top level
         whisper_feature = kwargs.get("whisper_input_feature")
         if whisper_feature is not None:
-            if isinstance(whisper_feature, (torch.Tensor, np.ndarray)):
+            if isinstance(whisper_feature, (torch.Tensor, np.ndarray)):  # noqa: UP038
                 if isinstance(whisper_feature, np.ndarray):
                     whisper_feature = torch.from_numpy(whisper_feature)
-                self._input_whisper_emb = whisper_feature
-                if not self._input_whisper_emb_logged:
-                    logger.info(
-                        "[DIAG STEP1] Whisper from kwargs top level: shape=%s mean=%.4f std=%.4f min=%.4f max=%.4f",
+
+                # Detect Mel spectrogram: shape [B, 128, T] or [128, T]
+                # Mel spectrograms have 128 frequency bins (Whisper config)
+                mel_dim = 128
+                is_mel = False
+                if whisper_feature.dim() == 3 and whisper_feature.shape[1] == mel_dim:
+                    is_mel = True
+                elif whisper_feature.dim() == 2 and whisper_feature.shape[0] == mel_dim:
+                    is_mel = True
+
+                if is_mel:
+                    # Route through upstream audio_tower pipeline:
+                    # Mel -> WhisperEncoder -> 4x downsample -> projector -> 3584-dim
+                    # audio_tower conv layers are bfloat16 on CUDA, so cast and move
+                    device = self.audio_tower.conv1.weight.device
+                    whisper_feature = whisper_feature.to(device=device, dtype=torch.bfloat16)
+                    audio_input = {"whisper_input_features": whisper_feature}
+                    self._input_whisper_emb = self._process_audio_input(audio_input)
+                    logger.debug(
+                        "Mel spectrogram routed through upstream audio_tower: %s -> %s",
                         list(whisper_feature.shape),
-                        whisper_feature.float().mean().item(),
-                        whisper_feature.float().std().item(),
-                        whisper_feature.float().min().item(),
-                        whisper_feature.float().max().item(),
+                        list(self._input_whisper_emb.shape),
                     )
-                    self._input_whisper_emb_logged = True
-            # Also check for raw 5120-dim Whisper features (pre-VQAdaptor)
+                else:
+                    # Pre-extracted features (5120-dim or 3584-dim) — store directly
+                    self._input_whisper_emb = whisper_feature
             whisper_raw = kwargs.get("whisper_raw")
-            if whisper_raw is not None and isinstance(whisper_raw, (torch.Tensor, np.ndarray)):
+            if whisper_raw is not None and isinstance(whisper_raw, (torch.Tensor, np.ndarray)):  # noqa: UP038
                 if isinstance(whisper_raw, np.ndarray):
                     whisper_raw = torch.from_numpy(whisper_raw).cuda()
                 elif whisper_raw.device.type != "cuda":
                     whisper_raw = whisper_raw.cuda()
                 self._input_whisper_raw = whisper_raw
-                if not self._input_whisper_raw_logged:
-                    logger.info(
-                        "[DIAG STEP1] Raw Whisper (5120-dim) from kwargs: shape=%s mean=%.4f std=%.4f",
-                        list(whisper_raw.shape),
-                        whisper_raw.float().mean().item(),
-                        whisper_raw.float().std().item(),
-                    )
-                    self._input_whisper_raw_logged = True
             return
 
         # Mode 2: Per-request Whisper features via model_intermediate_buffer
         buffer = kwargs.get("model_intermediate_buffer")
         if buffer is not None and isinstance(buffer, list):
-            if not self._input_whisper_emb_logged:
-                logger.info(
-                    "[DIAG STEP1b] model_intermediate_buffer has %d entries, first entry keys=%s",
-                    len(buffer),
-                    list(buffer[0].keys()) if buffer and isinstance(buffer[0], dict) else "N/A",
-                )
             for req_info in buffer:
                 if isinstance(req_info, dict) and "whisper_input_feature" in req_info:
                     whisper_feature = req_info["whisper_input_feature"]
-                    # Deserialize bfloat16 tensors arrive as numpy arrays
-                    # (see serialization.py line 119: bfloat16 → numpy).
-                    if isinstance(whisper_feature, (torch.Tensor, np.ndarray)):
+                    if isinstance(whisper_feature, (torch.Tensor, np.ndarray)):  # noqa: UP038
                         if isinstance(whisper_feature, np.ndarray):
                             whisper_feature = torch.from_numpy(whisper_feature)
-                        self._input_whisper_emb = whisper_feature
-                        if not self._input_whisper_emb_logged:
-                            logger.info(
-                                "[DIAG STEP1] Whisper from model_intermediate_buffer: shape=%s mean=%.4f std=%.4f",
-                                list(whisper_feature.shape),
-                                whisper_feature.float().mean().item(),
-                                whisper_feature.float().std().item(),
-                            )
-                            self._input_whisper_emb_logged = True
-                        # Also check for raw 5120-dim Whisper features
+
+                        # Detect Mel spectrogram: shape [B, 128, T] or [128, T]
+                        mel_dim = 128
+                        is_mel = False
+                        if whisper_feature.dim() == 3 and whisper_feature.shape[1] == mel_dim:
+                            is_mel = True
+                        elif whisper_feature.dim() == 2 and whisper_feature.shape[0] == mel_dim:
+                            is_mel = True
+
+                        if is_mel:
+                            # audio_tower conv layers are bfloat16 on CUDA, so cast and move
+                            device = self.audio_tower.conv1.weight.device
+                            whisper_feature = whisper_feature.to(device=device, dtype=torch.bfloat16)
+                            audio_input = {"whisper_input_features": whisper_feature}
+                            audio_inputs = self._parse_and_validate_audio_input(**audio_input)
+                            self._input_whisper_emb = self._process_audio_input(audio_inputs)
+                        else:
+                            self._input_whisper_emb = whisper_feature
                         whisper_raw = req_info.get("whisper_raw")
-                        if whisper_raw is not None and isinstance(whisper_raw, (torch.Tensor, np.ndarray)):
+                        if whisper_raw is not None and isinstance(whisper_raw, (torch.Tensor, np.ndarray)):  # noqa: UP038
                             if isinstance(whisper_raw, np.ndarray):
                                 whisper_raw = torch.from_numpy(whisper_raw).cuda()
                             elif whisper_raw.device.type != "cuda":
                                 whisper_raw = whisper_raw.cuda()
                             self._input_whisper_raw = whisper_raw
-                            self._input_whisper_raw = whisper_raw
-                            if not self._input_whisper_raw_logged:
-                                logger.info(
-                                    "[DIAG STEP1] Raw Whisper (5120-dim) from buffer: shape=%s mean=%.4f std=%.4f",
-                                    list(whisper_raw.shape),
-                                    whisper_raw.float().mean().item(),
-                                    whisper_raw.float().std().item(),
-                                )
-                                self._input_whisper_raw_logged = True
                         return
-                    # May be a serialized tensor (numpy bytes from serialization)
                     if isinstance(whisper_feature, dict) and "tensor_data" in whisper_feature:
                         try:
                             buf = bytes(whisper_feature["tensor_data"])
                             shape = tuple(whisper_feature["tensor_shape"])
                             dtype_name = whisper_feature.get("tensor_dtype", "float32")
-                            dtype_map = {"float32": np.float32, "float16": np.float16, "bfloat16": np.float16, "float64": np.float64}
+                            dtype_map = {
+                                "float32": np.float32,
+                                "float16": np.float16,
+                                "bfloat16": np.float16,
+                                "float64": np.float64,
+                            }
                             arr = np.frombuffer(buf, dtype=dtype_map.get(dtype_name, np.float32))
                             arr = arr.reshape(shape)
                             self._input_whisper_emb = torch.from_numpy(arr)
-                            if not self._input_whisper_emb_logged:
-                                logger.info(
-                                    "[DIAG STEP1] Whisper deserialized from buffer: shape=%s mean=%.4f std=%.4f",
-                                    list(self._input_whisper_emb.shape),
-                                    self._input_whisper_emb.float().mean().item(),
-                                    self._input_whisper_emb.float().std().item(),
-                                )
-                                self._input_whisper_emb_logged = True
                             return
                         except Exception as e:
                             logger.warning("Failed to deserialize Whisper features: %s", e)
                             return
 
-        # Mode 3: Raw audio array — extract features at runtime if not already
-        # captured via Mode 0/1/2.
-        if audio_array is not None and not self._input_whisper_emb_logged:
-            sample_rate = kwargs.get("audio_sample_rate", 16000)
-            try:
-                # Try reference Kimi-Audio WhisperEncoder first (produces identical
-                # features to the reference prompt_manager). Falls back to vLLM's
-                # HF-based extractor if reference is unavailable.
-                ref_emb = self._extract_reference_whisper_features(
-                    audio_array, sample_rate=int(sample_rate),
-                )
-                if ref_emb is not None:
-                    self._input_whisper_emb = ref_emb
-                    if not self._input_whisper_emb_logged:
-                        logger.info(
-                            "[DIAG STEP1] Reference Whisper extracted: shape=%s mean=%.4f std=%.4f",
-                            list(ref_emb.shape),
-                            ref_emb.float().mean().item(),
-                            ref_emb.float().std().item(),
-                        )
-                        self._input_whisper_emb_logged = True
-                    return
-
-                # Fallback: vLLM's HF-based Whisper extractor
-                extractor = self._get_whisper_extractor()
-                if extractor is None:
-                    logger.warning("[DIAG STEP1] Mode 3: audio_array present but Whisper extractor unavailable")
-                    return
-
-                whisper_emb = extractor.extract(audio_array, sample_rate=int(sample_rate))
-                self._input_whisper_emb = whisper_emb
-                if not self._input_whisper_emb_logged:
-                    logger.info(
-                        "[DIAG STEP1] Whisper extracted from audio (vLLM extractor): shape=%s mean=%.4f std=%.4f",
-                        list(whisper_emb.shape),
-                        whisper_emb.float().mean().item(),
-                        whisper_emb.float().std().item(),
-                    )
-                    self._input_whisper_emb_logged = True
-            except Exception as e:
-                logger.warning("Failed to extract Whisper features: %s", e)
-            return
-
-
-        # No whisper feature found
-        if not self._input_whisper_emb_logged:
-            # Also dump runtime_additional_information for debugging
-            runtime_info = kwargs.get("runtime_additional_information")
-            if runtime_info is not None:
-                logger.info(
-                    "[DIAG STEP1x] runtime_additional_information type=%s keys=%s",
-                    type(runtime_info).__name__,
-                    list(runtime_info.keys()) if isinstance(runtime_info, dict) else "N/A",
-                )
-                if isinstance(runtime_info, dict):
-                    for k, v in runtime_info.items():
-                        if isinstance(v, dict):
-                            logger.info("[DIAG STEP1x]   %s -> dict keys=%s", k, list(v.keys())[:10])
-                        elif isinstance(v, (list, tuple)):
-                            logger.info("[DIAG STEP1x]   %s -> %s len=%d", k, type(v).__name__, len(v))
-                        elif hasattr(v, 'shape'):
-                            logger.info("[DIAG STEP1x]   %s -> tensor shape=%s", k, list(v.shape))
-                        else:
-                            logger.info("[DIAG STEP1x]   %s -> %s", k, type(v).__name__)
-            logger.info("[DIAG STEP1] No Whisper features found in kwargs. keys=%s", list(kwargs.keys()))
-
     def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        """Apply token embeddings to input_ids for vLLM runner compatibility.
-
-        Detects decode vs prefill based on input length: decode processes
-        single tokens (shape[-1] == 1), prefill processes sequences.
-
-        Also extracts Whisper features from kwargs (audio_array or
-        whisper_input_feature) for speech-to-speech conditioning.
-        """
+        """Apply token embeddings with S2S dual-stream Whisper injection."""
         is_decode = input_ids.dim() > 0 and input_ids.shape[-1] == 1
-
-        # Extract Whisper features from kwargs (set by serving layer or
-        # passed through the prompt's additional_information).
         if not is_decode and kwargs:
             self._extract_whisper_from_kwargs(kwargs)
-
         return self._combine_audio_text_embeds(input_ids, is_decode=is_decode)
+
+    def _inject_whisper_into_embeds(
+        self,
+        inputs_embeds: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Inject Whisper features into pre-built inputs_embeds using input_ids for positioning.
+
+        Called from forward() when both input_ids and inputs_embeds are provided.
+        The runner fills inputs_embeds with token embeddings, and we overlay
+        Whisper features at audio token positions.
+        """
+        # Apply multi_modal_projector (VQAdaptor) to convert 5120-dim → 3584-dim
+        whisper_raw = self._input_whisper_emb
+        if whisper_raw.dim() == 4:
+            whisper_raw = whisper_raw.reshape(1, -1, whisper_raw.shape[-1])
+        elif whisper_raw.dim() == 2:
+            whisper_raw = whisper_raw.unsqueeze(0)
+
+        # Apply projector only if features are still 5120-dim
+        if whisper_raw.shape[-1] == 5120:
+            whisper_3584 = (
+                self.multi_modal_projector(
+                    whisper_raw.to(device=inputs_embeds.device, dtype=torch.bfloat16)
+                )
+                .squeeze(0)
+                .to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+            )
+        else:
+            whisper_3584 = whisper_raw.squeeze(0).to(
+                inputs_embeds.device, dtype=inputs_embeds.dtype
+            )
+
+        # Determine audio positions from input_ids
+        if input_ids is not None:
+            ids = input_ids.squeeze(0) if input_ids.dim() == 2 else input_ids
+            media_begin = int(self.config.kimia_media_begin)
+            media_end = int(self.config.kimia_media_end)
+            mb_pos = (ids == media_begin).nonzero(as_tuple=True)[0]
+            me_pos = (ids == media_end).nonzero(as_tuple=True)[0]
+
+            if len(mb_pos) > 0 and len(me_pos) > 0:
+                seg_len = len(mb_pos)
+                for seg_idx in range(seg_len):
+                    start_pos = mb_pos[seg_idx].item()
+                    end_pos = me_pos[seg_idx].item()
+                    feat_len = end_pos - (start_pos + 1)
+                    if feat_len > 0:
+                        # Inject Whisper at audio positions
+                        inputs_embeds[start_pos + 1 : end_pos] = whisper_3584[:feat_len]
+
+                # Apply scaling: (embeds + whisper) * sqrt(2) at audio positions
+                # This matches the prefill path scaling in _combine_audio_text_embeds
+                audio_mask = torch.zeros(inputs_embeds.shape[0], dtype=torch.bool, device=inputs_embeds.device)
+                for seg_idx in range(seg_len):
+                    audio_mask[mb_pos[seg_idx].item() + 1 : me_pos[seg_idx].item()] = True
+
+                # Apply the same (embed + whisper) * sqrt(2) scaling
+                inputs_embeds[audio_mask] = inputs_embeds[audio_mask] * (2.0**0.5)
+
+                if getattr(self, "_decode_whisper_frames", None) is None:
+                    self._decode_whisper_frames = whisper_3584.clone()
+                if getattr(self, "_decode_whisper_template", None) is None:
+                    self._decode_whisper_template = whisper_3584.mean(dim=0, keepdim=True).clone()
+
+        return inputs_embeds
 
     def _combine_audio_text_embeds(
         self,
@@ -944,80 +784,55 @@ class KimiaAudioFusedForConditionalGeneration(
         text_input_ids: torch.Tensor | None = None,
         is_continuous_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Combine text and audio embeddings from dual-stream token inputs.
-
-        The reference Kimi-Audio model expects TWO token streams at every
-        position: audio tokens (input_ids) and text tokens (text_input_ids).
-        Embeddings are summed: inputs_embeds = embed(audio_ids) + embed(text_ids).
-
-        During prefill: construct audio placeholder tokens from text tokens,
-        embed both, and sum (matching the reference's dual-stream embedding).
-
-        During decode: vLLM only feeds back text tokens. We use self-stored
-        audio codes to construct the audio embedding (self-feedback).
-        """
+        """Combine text and audio embeddings with Whisper injection for S2S."""
         token_offset = int(getattr(self.config, "kimia_token_offset", 152064))
-        embed_tokens = self.embed_tokens
+        # Access embed_tokens from upstream's language_model
+        embed_tokens_fn = self.language_model.model.embed_tokens
 
         if input_ids is None:
+            # Runner path: inputs_embeds pre-built without Whisper injection.
+            # Inject Whisper features using stored audio position info.
+            if inputs_embeds is not None and self._input_whisper_emb is not None:
+                return self._inject_whisper_into_embeds(inputs_embeds)
             return inputs_embeds if inputs_embeds is not None else None
 
-        # Decode path: use self-stored audio code (vLLM doesn't feed back audio)
-        # During the audio delay period, use blank tokens instead of real codes
-        # (matching reference: next_audio_token.fill_(blank) for i < delay_tokens).
-        #
-        # CRITICAL FIX: During decode, the audio embedding MUST match the per-frame
-        # distribution from prefill: (audio_embed + whisper_frame) * sqrt(2).
-        # Without whisper features, the MIMO layers receive a completely different
-        # input distribution during decode, causing degeneration.
+        # Decode path
         if is_decode:
             delay_tokens = int(getattr(self.config, "kimia_mimo_audiodelaytokens", 6))
             decode_step = getattr(self, "_decode_step_counter", 0)
             use_delay_blank = decode_step < delay_tokens
 
-            # Embed text tokens from input_ids (vLLM feeds back generated text).
-            text_embed = embed_tokens(input_ids)
+            text_embed = embed_tokens_fn(input_ids)
 
             if use_delay_blank:
-                # During delay period: use blank audio token as self-feedback.
-                # Use a relative audio index that's valid for embedding lookup.
-                audio_blank_index = 18  # relative audio token index
+                audio_blank_index = 18
                 audio_ids = torch.full_like(input_ids, audio_blank_index + token_offset)
-                audio_embed = embed_tokens(audio_ids)
+                audio_embed = embed_tokens_fn(audio_ids)
+            elif torch.cuda.is_current_stream_capturing():
+                # During CUDA graph capture, use blank audio embedding to avoid
+                # graph-incompatible .item() and Python state access.
+                audio_blank_index = 18
+                audio_ids = torch.full_like(input_ids, audio_blank_index + token_offset)
+                audio_embed = embed_tokens_fn(audio_ids)
             else:
-                # After delay period: use real audio codes as self-feedback.
-                # _audio_codes_list stores RELATIVE indices — convert to absolute.
                 if hasattr(self, "_audio_codes_list") and len(self._audio_codes_list) > 0:
                     last_code = self._audio_codes_list[-1]
                     if last_code.numel() >= 1:
                         code_val = last_code.reshape(-1)[-1].item() + token_offset
                         audio_ids = torch.full_like(input_ids, code_val)
-                        audio_embed = embed_tokens(audio_ids)
+                        audio_embed = embed_tokens_fn(audio_ids)
                     else:
                         audio_blank_index = 18
                         audio_ids = torch.full_like(input_ids, audio_blank_index + token_offset)
-                        audio_embed = embed_tokens(audio_ids)
+                        audio_embed = embed_tokens_fn(audio_ids)
                 else:
                     audio_blank_index = 18
                     audio_ids = torch.full_like(input_ids, audio_blank_index + token_offset)
-                    audio_embed = embed_tokens(audio_ids)
+                    audio_embed = embed_tokens_fn(audio_ids)
 
-            # Decode: NO whisper features during decode.
-            # The reference Kimi-Audio pipeline sets decoder_input_whisper_feature=None
-            # and decoder_is_continuous_mask=None during decode (see kimia.py:191-192).
-            # Whisper features are ONLY for prefill conditioning.
             return audio_embed + text_embed
 
-        # Prefill path: construct parallel audio+text embeddings.
-        # Match the reference model (modeling_moonshot_kimia.py:705-759):
-        #   1. audio_emb = embed_tokens(input_ids) — uses actual token IDs
-        #   2. Find media_begin/media_end positions in input_ids
-        #   3. Place whisper features at positions media_start+1 .. media_end
-        #   4. (audio_emb + whisper) * sqrt(2) at masked positions
-        #   5. Keep original audio_emb at wrapper positions
-        #   6. inputs_embeds = audio_emb + embed_tokens(text_input_ids)
-
-        # Squeeze batch dimension if present — vLLM may pass [1, seq] or [seq]
+        # Prefill path
         if input_ids.dim() == 2:
             input_ids = input_ids.squeeze(0)
         if text_input_ids is not None and text_input_ids.dim() == 2:
@@ -1025,120 +840,107 @@ class KimiaAudioFusedForConditionalGeneration(
         if is_continuous_mask is not None and is_continuous_mask.dim() == 2:
             is_continuous_mask = is_continuous_mask.squeeze(0)
 
-        # Step 1: Embed actual audio token IDs (including wrappers)
-        audio_emb = embed_tokens(input_ids)  # [seq_len, 3584]
+        # Use runner-provided inputs_embeds as base (already embedded via embed_input_ids)
+        # instead of re-embedding input_ids, to match the runner's embedding computation
+        if inputs_embeds is not None and inputs_embeds.dim() == 2:
+            audio_emb = inputs_embeds.squeeze(0)
+        else:
+            audio_emb = embed_tokens_fn(input_ids)
         seq_len = audio_emb.shape[0]
 
-        # Step 2: Embed text token IDs
         if text_input_ids is not None and text_input_ids.numel() > 0:
-            text_emb = embed_tokens(text_input_ids)  # [text_len, 3584]
+            text_emb = embed_tokens_fn(text_input_ids)
         else:
             text_emb = None
 
-        # Profile/warmup run: no is_continuous_mask provided — skip Whisper injection
+        # Derive is_continuous_mask from S2S scaffolding if not provided
         if is_continuous_mask is None:
-            self._prefill_audio_offset = seq_len
-            return audio_emb if text_emb is None else audio_emb + text_emb
+            if self._input_whisper_emb is not None:
+                media_begin = int(self.config.kimia_media_begin)
+                media_end = int(self.config.kimia_media_end)
+                mb_pos = (input_ids == media_begin).nonzero(as_tuple=True)[0]
+                me_pos = (input_ids == media_end).nonzero(as_tuple=True)[0]
+                if len(mb_pos) > 0 and len(me_pos) > 0:
+                    is_continuous_mask = torch.zeros(seq_len, dtype=torch.bool, device=input_ids.device)
+                    is_continuous_mask[mb_pos[0].item() + 1 : me_pos[0].item()] = True
+                else:
+                    self._prefill_audio_offset = seq_len
+                    return audio_emb if text_emb is None else audio_emb + text_emb
+            else:
+                self._prefill_audio_offset = seq_len
+                return audio_emb if text_emb is None else audio_emb + text_emb
 
-        # Priority 1: Per-request Whisper features from input audio
+        # Inject Whisper features at audio positions
         if self._input_whisper_emb is not None:
-            # _input_whisper_emb: [1, audio_frames, 3584] — already post-VQAdaptor
-            whisper_3584 = self._input_whisper_emb.squeeze(0).to(
-                audio_emb.device, dtype=audio_emb.dtype,
-            )  # [audio_frames, 3584]
-            audio_frames = whisper_3584.shape[0]
+            whisper_raw = self._input_whisper_emb
+            if whisper_raw.dim() == 4:
+                whisper_raw = whisper_raw.reshape(1, -1, whisper_raw.shape[-1])
+            elif whisper_raw.dim() == 2:
+                whisper_raw = whisper_raw.unsqueeze(0)
 
-            # Step 2: Find media boundaries in input_ids (1D tensor)
-            media_begin = int(self.config.kimia_media_begin)  # 151661
-            media_end = int(self.config.kimia_media_end)      # 151663
+            # Apply multi_modal_projector only if features are still 5120-dim
+            # (e.g., from realtime buffer). Test scripts and runner may already
+            # provide 3584-dim post-VQAdaptor features.
+            if whisper_raw.shape[-1] == 5120:
+                whisper_3584 = (
+                    self.multi_modal_projector(
+                        whisper_raw.to(device=audio_emb.device, dtype=torch.bfloat16)
+                    )
+                    .squeeze(0)
+                    .to(audio_emb.device, dtype=audio_emb.dtype)
+                )
+            else:
+                whisper_3584 = whisper_raw.squeeze(0).to(
+                    audio_emb.device, dtype=audio_emb.dtype
+                )
 
-            media_start_pos = (input_ids == media_begin).nonzero(as_tuple=True)[0]
-            media_end_pos = (input_ids == media_end).nonzero(as_tuple=True)[0]
-
-            # Step 3: Create expanded whisper features [seq_len, 3584] — zeros everywhere
-            expanded_whisper = torch.zeros(seq_len, audio_emb.shape[-1],
-                                           device=audio_emb.device, dtype=audio_emb.dtype)
-
-            # Place whisper features at positions media_start+1 .. media_end for each segment
-            for seg_idx in range(len(media_start_pos)):
-                start_pos = media_start_pos[seg_idx].item()
-                end_pos = media_end_pos[seg_idx].item()
-                feat_len = end_pos - (start_pos + 1)
-                if feat_len > 0:
-                    expanded_whisper[start_pos + 1: end_pos, :] = whisper_3584[:feat_len, :]
-
-            # Step 4: Apply mask and combine (matching reference exactly)
-            is_continuous_mask_3d = is_continuous_mask.to(audio_emb.dtype).unsqueeze(-1)  # [seq_len, 1]
-            whisper_masked = expanded_whisper * is_continuous_mask_3d  # zero out non-audio positions
-
-            # (audio_emb + whisper) * sqrt(2) at ALL positions (whisper is zero where masked)
-            encoder_input = (audio_emb + whisper_masked) * (2.0 ** 0.5)
-
-            # Keep original audio_emb at non-masked positions, use combined at masked positions
-            audio_emb = (audio_emb * (~is_continuous_mask_3d.to(torch.bool)) +
-                         encoder_input * is_continuous_mask_3d.to(torch.bool))
-
-            # Store for position override in forward()
-            self._prefill_audio_offset = seq_len
-
-            # Store whisper features for decode augmentation.
-            if getattr(self, '_decode_whisper_frames', None) is None:
-                self._decode_whisper_frames = whisper_3584.clone()  # [audio_frames, 3584]
-            if getattr(self, '_decode_whisper_template', None) is None:
-                self._decode_whisper_template = whisper_3584.mean(dim=0, keepdim=True).clone()
-
-            # Final combination: audio_emb + text_emb (matching reference line 757)
-            result = audio_emb + text_emb
-
-            # DIAG: Save embedding output for comparison
-            if os.environ.get("KIMIA_DIAG_EMBED", "0") == "1":
-                torch.save(result.detach().cpu(), "/tmp/vllm_embed_output.pt")
-                logger.info("[DIAG EMBED] Saved vLLM embedding output to /tmp/vllm_embed_output.pt")
-
-            return result
-
-        # Priority 2: Static Whisper embedding from reference audio (S2S)
-        if self._whisper_emb is not None:
-            whisper_3584 = self._whisper_emb.squeeze(0).to(
-                audio_emb.device, dtype=audio_emb.dtype,
-            )  # [audio_frames, 3584]
-            audio_frames = whisper_3584.shape[0]
-
-            # Find media boundaries in input_ids (1D tensor)
             media_begin = int(self.config.kimia_media_begin)
             media_end = int(self.config.kimia_media_end)
-
             media_start_pos = (input_ids == media_begin).nonzero(as_tuple=True)[0]
             media_end_pos = (input_ids == media_end).nonzero(as_tuple=True)[0]
 
-            # Place whisper features at correct positions
-            expanded_whisper = torch.zeros(seq_len, audio_emb.shape[-1],
-                                           device=audio_emb.device, dtype=audio_emb.dtype)
+            expanded_whisper = torch.zeros(seq_len, audio_emb.shape[-1], device=audio_emb.device, dtype=audio_emb.dtype)
             for seg_idx in range(len(media_start_pos)):
                 start_pos = media_start_pos[seg_idx].item()
                 end_pos = media_end_pos[seg_idx].item()
                 feat_len = end_pos - (start_pos + 1)
                 if feat_len > 0:
-                    expanded_whisper[start_pos + 1: end_pos, :] = whisper_3584[:feat_len, :]
+                    expanded_whisper[start_pos + 1 : end_pos, :] = whisper_3584[:feat_len, :]
 
-            # Apply mask and combine
             is_continuous_mask_3d = is_continuous_mask.to(audio_emb.dtype).unsqueeze(-1)
             whisper_masked = expanded_whisper * is_continuous_mask_3d
-            encoder_input = (audio_emb + whisper_masked) * (2.0 ** 0.5)
-            audio_emb = (audio_emb * (~is_continuous_mask_3d.to(torch.bool)) +
-                         encoder_input * is_continuous_mask_3d.to(torch.bool))
+            encoder_input = (audio_emb + whisper_masked) * (2.0**0.5)
+            audio_emb = audio_emb * (~is_continuous_mask_3d.to(torch.bool)) + encoder_input * is_continuous_mask_3d.to(
+                torch.bool
+            )
 
             self._prefill_audio_offset = seq_len
 
-            if getattr(self, '_decode_whisper_frames', None) is None:
+            if getattr(self, "_decode_whisper_frames", None) is None:
                 self._decode_whisper_frames = whisper_3584.clone()
-            if getattr(self, '_decode_whisper_template', None) is None:
+            if getattr(self, "_decode_whisper_template", None) is None:
                 self._decode_whisper_template = whisper_3584.mean(dim=0, keepdim=True).clone()
 
-            return audio_emb + text_emb
+            if os.environ.get("KIMIA_DIAG_EMBED", "0") == "1":
+                result = audio_emb if text_emb is None else audio_emb + text_emb
+                torch.save(result.detach().cpu(), "/tmp/vllm_embed_output.pt")
+                # Save intermediates for debugging
+                torch.save(
+                    {
+                        "audio_emb": audio_emb.detach().cpu(),
+                        "text_emb": text_emb.detach().cpu() if text_emb is not None else None,
+                        "whisper_3584": whisper_3584.detach().cpu(),
+                        "is_continuous_mask": is_continuous_mask.detach().cpu(),
+                        "input_ids": input_ids.detach().cpu(),
+                        "text_input_ids": text_input_ids.detach().cpu() if text_input_ids is not None else None,
+                    },
+                    "/tmp/vllm_embed_intermediates.pt",
+                )
+                return result
 
-        # Fallback — audio placeholders only (warmup, profile, no Whisper features).
-        # Used during model warmup/profile runs when no Whisper features are available.
+            return audio_emb if text_emb is None else audio_emb + text_emb
+
+        # Fallback
         self._prefill_audio_offset = seq_len
         return audio_emb if text_emb is None else audio_emb + text_emb
 
@@ -1150,31 +952,25 @@ class KimiaAudioFusedForConditionalGeneration(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor | OmniOutput:
-        """Forward pass using vLLM-native decoder layers.
-
-        Uses vLLM's Qwen2DecoderLayer for both backbone (28 layers) and MIMO
-        (6 layers) branches, with vLLM's pre-allocated KV cache.
-
-        vLLM layer forward signature: layer(positions, hidden_states, residual)
-        → (hidden_states, residual)
-        """
-        # Token offset for audio token ID space
+        """Forward pass with bifurcation at layer 21 for MIMO branch."""
         token_offset = int(getattr(self.config, "kimia_token_offset", 152064))
-
-        # Detect prefill vs decode phase
-        is_prefill = input_ids is not None and input_ids.dim() > 0 and input_ids.shape[-1] > 1
-
-        # Profile run detection only (large sequences for memory profiling).
-        # Graph capture and real inference use the SAME forward path —
-        # vLLM models have NO warmup detection in their forward methods.
-        _seq_len = input_ids.shape[-1] if input_ids is not None and input_ids.dim() > 0 else 0
+        # Detect prefill: either multi-token input_ids OR multi-token inputs_embeds.
+        # S2S prefill uses inputs_embeds (not input_ids), so we must check both.
+        # Priority: input_ids shape (correct) > inputs_embeds shape[0] (2D runner path).
+        if input_ids is not None and input_ids.numel() > 0:
+            _seq_len = input_ids.shape[-1] if input_ids.dim() > 0 else 0
+        elif inputs_embeds is not None and inputs_embeds.dim() >= 1:
+            _seq_len = inputs_embeds.shape[0] if inputs_embeds.dim() == 2 else inputs_embeds.shape[1]
+        else:
+            _seq_len = 0
+        is_prefill = _seq_len > 1
         is_profile_run = _seq_len > 1000
 
-        # Reset state at start of new request (prefill)
+        # Reset state at start of new request
         if is_prefill:
             self._decode_step_counter = 0
+            self._sample_step_counter = 0
             self._audio_codes_list = []
-            self._audio_code_cap_logged = False
             self._input_whisper_emb = None
             self._input_whisper_emb_logged = False
             self._input_whisper_raw = None
@@ -1186,138 +982,146 @@ class KimiaAudioFusedForConditionalGeneration(
             self._decode_whisper_template = None
             self._decode_whisper_frames = None
 
-        # Extract Whisper features from kwargs
         if is_prefill and kwargs:
             self._extract_whisper_from_kwargs(kwargs)
-
-        # DIAGNOSTIC: Log audio code self-feedback during decode (graph-compatible)
-        if not is_prefill and not is_profile_run and input_ids is not None:
-            if self._diag_decode_log_count < 50:
-                self._diag_decode_log_count += 1
-                logger.info(
-                    "DIAG decode#%d input_ids_shape=%s, positions_shape=%s",
-                    self._diag_decode_log_count,
-                    list(input_ids.shape),
-                    list(positions.shape),
-                )
 
         # Embed input on first rank
         is_decode = not is_prefill
 
         if get_pp_group().is_first_rank:
             hidden_states = self._combine_audio_text_embeds(
-                input_ids, inputs_embeds, is_decode=is_decode,
+                input_ids,
+                inputs_embeds,
+                is_decode=is_decode,
                 text_input_ids=kwargs.get("text_input_ids"),
                 is_continuous_mask=kwargs.get("is_continuous_mask"),
             )
-            residual = None
 
-            # Override positions for parallel combined sequence during prefill
-            if is_prefill and getattr(self, '_prefill_audio_offset', 0) > 0:
+            # Override positions for combined sequence during prefill
+            if is_prefill and getattr(self, "_prefill_audio_offset", 0) > 0:
                 audio_offset = self._prefill_audio_offset
-                _text_len = input_ids.shape[-1]
+                _text_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
                 full_seq_len = max(audio_offset, _text_len)
                 positions = torch.arange(full_seq_len, device=positions.device, dtype=positions.dtype)
                 if hidden_states.dim() == 3 and positions.dim() == 1:
                     positions = positions.unsqueeze(0)
 
-            # Store prefill sequence length for decode position offset
             if is_prefill:
-                _text_len_for_seq = input_ids.shape[-1]
-                self._prefill_seq_len = max(getattr(self, '_prefill_audio_offset', 0), _text_len_for_seq)
+                _text_len_for_seq = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+                self._prefill_seq_len = max(getattr(self, "_prefill_audio_offset", 0), _text_len_for_seq)
                 self._prefill_text_len = _text_len_for_seq
-            elif not is_prefill and getattr(self, '_prefill_seq_len', 0) > 0:
+            elif not is_prefill and getattr(self, "_prefill_seq_len", 0) > 0:
                 pos_delta = self._prefill_seq_len - self._prefill_text_len
                 positions = positions + pos_delta
-
-            # DIAG: Log embedded input during decode
-            if not is_prefill and not is_profile_run and self._diag_decode_log_count <= 50:
-                logger.info(
-                    "DIAG decode embed#%d: shape=%s",
-                    self._diag_decode_log_count,
-                    list(hidden_states.shape),
-                )
         else:
-            # Non-first rank: receive hidden_states from intermediate tensors
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors.get("residual")
 
-        # Run backbone layers using vLLM-native pattern
-        # vLLM Qwen2DecoderLayer: forward(positions, hidden_states, residual) → (hidden_states, residual)
+        # Run backbone via self.language_model.model with bifurcation hook at layer 21
+        # to capture mimo_hidden_states
         bifurcation_idx = self._bifurcation_layer
-        num_layers = len(self.layers)
-        end_layer = num_layers if get_pp_group().is_last_rank else bifurcation_idx + 1
 
-        # DIAG: Dump hidden_states right before first layer call
-        if not is_profile_run:
-            _hs = hidden_states.float()
-            logger.info(
-                "[DIAG HS-PRE] hidden_states pre-layer: shape=%s mean=%.6f std=%.6f min=%.6f max=%.6f",
-                list(_hs.shape), _hs.mean().item(), _hs.std().item(), _hs.min().item(), _hs.max().item(),
+        # Register hook on bifurcation layer — needed on all ranks that process it
+        # to populate mimo_hidden_states for intermediate tensor forwarding
+        mimo_hidden_states = None
+        hook_handle = None
+        bifurcation_layer = self.language_model.model.layers[bifurcation_idx]
+
+        def _bifurcation_hook(module, input, output):
+            nonlocal mimo_hidden_states
+            hs = output[0] if isinstance(output, tuple) else output
+            mimo_hidden_states = hs.clone()
+            # Capture bifurcation output for debugging
+            if os.environ.get("CAPTURE_MIMO", "0") == "1":
+                capture_dir = os.environ.get("CAPTURE_MIMO_DIR", "/tmp/mimo_capture")
+                os.makedirs(capture_dir, exist_ok=True)
+                torch.save({
+                    "hidden_states": hs.detach().float().cpu(),
+                }, os.path.join(capture_dir, "bifurcation_output.pt"))
+
+        hook_handle = bifurcation_layer.register_forward_hook(_bifurcation_hook)
+
+        try:
+            # Delegate to self.language_model.model — bypass __call__ to avoid
+            # torch.compile tracing diagnostic hooks in scripts like compare_layer_by_layer
+            result = self.language_model.model.forward(
+                input_ids=input_ids if not get_pp_group().is_first_rank else None,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=hidden_states if get_pp_group().is_first_rank else None,
             )
-            # Per-position stats for first 5 and last 3
-            for i in [0, 1, 2, 25, 50, 51, 52]:
-                if i < _hs.shape[0]:
-                    pos = _hs[i]
-                    logger.info("[DIAG HS-PRE]   pos[%d]: mean=%.6f std=%.6f", i, pos.mean().item(), pos.std().item())
-            # Save for comparison
-            torch.save(hidden_states.detach().cpu(), "/tmp/vllm_hs_pre_layer.pt")
 
-        if is_profile_run:
-            # Profile: skip layers — dummy run needs shapes only
-            seq_len = hidden_states.shape[0] if hidden_states.dim() == 2 else hidden_states.shape[1]
-            mimo_hidden_states = hidden_states.clone() if get_pp_group().is_last_rank else None
-            logger.info("[DIAG PROFILE] Skipping backbone layers (seq_len=%d)", seq_len)
-        elif get_pp_group().is_first_rank or (not get_pp_group().is_first_rank and not get_pp_group().is_last_rank):
-            # Run backbone layers up to bifurcation point (or all on first rank for non-PP)
-            for idx in range(0, end_layer):
-                # vLLM layers work with 2D [num_tokens, hidden] directly
-                layer = self.layers[idx]
-                hidden_states, residual = layer(positions, hidden_states, residual)
+            # Non-last ranks: return IntermediateTensors
+            if not get_pp_group().is_last_rank:
+                # Include mimo_hidden_states if captured at bifurcation
+                hs_tensor = result["hidden_states"]
+                res = result.get("residual")
+                tensors = {"hidden_states": hs_tensor}
+                if mimo_hidden_states is not None:
+                    tensors["mimo_hidden_states"] = mimo_hidden_states
+                if res is not None:
+                    tensors["residual"] = res
+                return IntermediateTensors(tensors)
 
-                # Capture at bifurcation point for MIMO branch
-                if idx == bifurcation_idx:
-                    mimo_hidden_states = hidden_states.clone()
-
-        if not get_pp_group().is_last_rank:
-            tensors = {"hidden_states": hidden_states}
-            if mimo_hidden_states is not None:
-                tensors["mimo_hidden_states"] = mimo_hidden_states
-            if residual is not None:
-                tensors["residual"] = residual
-            return IntermediateTensors(tensors)
-
-        # Last rank: continue with remaining backbone layers (if PP)
-        if not get_pp_group().is_first_rank:
-            start_layer = bifurcation_idx + 1
-            for idx in range(start_layer, num_layers):
-                hidden_states, residual = self.layers[idx](positions, hidden_states, residual)
-
-        # Apply backbone norm
-        hidden_states = self.norm(hidden_states)
-        text_hidden_states = hidden_states
-
-        # Run MIMO layers
-        if mimo_hidden_states is not None:
-            if is_profile_run:
-                logger.info("[DIAG PROFILE] Skipping MIMO layers")
+            # self.language_model.model already applied self.norm — result IS normed
+            # Result may be tuple (hidden_states, aux_hidden_states) if EAGLE enabled
+            if isinstance(result, tuple):
+                hidden_states = result[0]
             else:
-                mimo_residual = None
-                for i, mimo_layer in enumerate(self.mimo_layers):
-                    mimo_hidden_states, mimo_residual = mimo_layer(positions, mimo_hidden_states, mimo_residual)
+                hidden_states = result
+            text_hidden_states = hidden_states
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
 
-            # Apply MIMO norm
+        # Run MIMO layers on the bifurcated hidden states. During prefill, MIMO
+        # processes audio scaffolding tokens (ID 152082 = blank 18 + offset 152064)
+        # whose hidden states already contain Whisper-injected features from the
+        # backbone. This populates the MIMO KV cache with Whisper-informed audio
+        # context, matching the reference model's behavior. During decode, MIMO
+        # runs on newly generated audio codes and attends to both prefill cache
+        # entries and previously generated codes.
+        if mimo_hidden_states is not None:
+            # === CAPTURE HOOK: save MIMO layer I/O for debugging ===
+            _capture_mimo = os.environ.get("CAPTURE_MIMO", "0") == "1"
+            _mimo_capture_dir = os.environ.get("CAPTURE_MIMO_DIR", "/tmp/mimo_capture")
+            if _capture_mimo:
+                os.makedirs(_mimo_capture_dir, exist_ok=True)
+            mimo_residual = None
+            for layer_idx, mimo_layer in enumerate(self.mimo_layers):
+                if _capture_mimo:
+                    torch.save({
+                        "input": mimo_hidden_states.detach().float().cpu(),
+                        "residual": mimo_residual.detach().float().cpu() if mimo_residual is not None else None,
+                        "positions": positions.detach().cpu(),
+                    }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_input.pt"))
+                mimo_hidden_states, mimo_residual = mimo_layer(positions, mimo_hidden_states, mimo_residual)
+                if _capture_mimo:
+                    torch.save({
+                        "output": mimo_hidden_states.detach().float().cpu(),
+                    }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_output.pt"))
+            if _capture_mimo:
+                torch.save({
+                    "mimo_norm_input": mimo_hidden_states.detach().float().cpu(),
+                }, os.path.join(_mimo_capture_dir, "before_norm.pt"))
+
             mimo_hidden_states = self.mimo_norm(mimo_hidden_states)
+            if _capture_mimo:
+                torch.save({
+                    "mimo_norm_output": mimo_hidden_states.detach().float().cpu(),
+                }, os.path.join(_mimo_capture_dir, "after_norm.pt"))
 
-            # Compute audio logits
+            audio_logits_out = self.mimo_output(mimo_hidden_states)
+            if _capture_mimo:
+                torch.save({
+                    "mimo_logits": audio_logits_out.detach().float().cpu() if isinstance(audio_logits_out, torch.Tensor) else audio_logits_out[0].detach().float().cpu(),
+                }, os.path.join(_mimo_capture_dir, "mimo_logits.pt"))
             audio_logits_out = self.mimo_output(mimo_hidden_states)
             if isinstance(audio_logits_out, tuple):
                 audio_logits = audio_logits_out[0]
             else:
                 audio_logits = audio_logits_out
 
-            # Slice to audio subspace
             audio_vocab = int(getattr(self.config, "kimia_audio_output_vocab", 16384))
             if audio_logits.dim() == 2:
                 audio_logits_sub = audio_logits[:, token_offset : token_offset + audio_vocab]
@@ -1326,116 +1130,124 @@ class KimiaAudioFusedForConditionalGeneration(
             else:
                 raise ValueError(f"Unexpected audio_logits dim: {audio_logits.dim()}, shape: {audio_logits.shape}")
 
-            # Sample audio codes
-            audio_codes = _sample_audio_topk(
-                audio_logits_sub,
-                top_k=10,
-                temperature=0.8,
-                repetition_penalty=float(getattr(self.config, "kimia_repetition_penalty", 1.1)),
-                recent_tokens=None,
-                repetition_window=64,
-            )
+            # Return audio_logits via multimodal_outputs so they are
+            # updated during CUDA graph replay (return values are part of
+            # the graph, instance attributes are not). The runner extracts
+            # them and passes to model.sample().
+            self._audio_logits = audio_logits_sub
 
-            # Accumulate audio codes
             if is_profile_run:
                 self._audio_codes = torch.empty(0, dtype=torch.long)
+                self._audio_codes_list = []
+                self._decode_step_counter = 0
+                self._sample_step_counter = 0
                 self._text_codes = torch.empty(0, dtype=torch.long)
-                multimodal_outputs = {"audio_codes": None, "text_codes": None}
+                multimodal_outputs = {
+                    "audio_codes": torch.empty(0, dtype=torch.long),
+                    "audio_logits": audio_logits_sub,
+                    "text_codes": None,
+                }
             else:
-                delay_tokens = int(getattr(self.config, "kimia_mimo_audiodelaytokens", 6))
-
-                if is_prefill:
-                    # During prefill, only use the last position's audio code
-                    # (properly AR-conditioned)
-                    if audio_codes.dim() == 1:
-                        last_code = audio_codes[-1]
-                    else:
-                        last_code = audio_codes[:, -1]
-                    self._audio_codes_list.append(last_code.reshape(-1))
-                    self._decode_step_counter = 0
-
-                    # Compute dynamic audio cap
-                    num_text_tokens = input_ids.shape[-1]
-                    dynamic_cap = 500
-                    self._dynamic_audio_cap = min(max(dynamic_cap, 150), self._max_audio_codes)
-
-                    multimodal_outputs = {
-                        "audio_codes": last_code.reshape(-1),
-                        "text_codes": self._text_codes.reshape(-1) if hasattr(self, '_text_codes') and self._text_codes is not None and self._text_codes.numel() > 0 else None,
-                    }
-                else:
-                    # Decode step: accumulate codes
-                    self._decode_step_counter += 1
-                    effective_cap = getattr(self, "_dynamic_audio_cap", self._max_audio_codes)
-                    total_so_far = sum(c.numel() for c in self._audio_codes_list)
-                    if total_so_far >= effective_cap:
-                        if not self._audio_code_cap_logged:
-                            self._audio_code_cap_logged = True
-                            logger.info(
-                                "Kimia-Audio AR: reached audio cap (%d codes, ~%.1fs) at decode step %d",
-                                effective_cap, effective_cap / 50.0, self._decode_step_counter,
-                            )
-                        multimodal_outputs = {"audio_codes": None, "text_codes": None}
-                        return OmniOutput(
-                            text_hidden_states=text_hidden_states,
-                            multimodal_outputs=multimodal_outputs,
-                        )
-
-                    # Store codes (blank during delay period)
-                    if self._decode_step_counter <= delay_tokens:
-                        blank_codes = torch.zeros_like(audio_codes)
-                        self._audio_codes_list.append(blank_codes)
-                    else:
-                        self._audio_codes_list.append(audio_codes)
-
-                    all_codes = torch.cat([c.reshape(-1) for c in self._audio_codes_list], dim=0)
-                    self._audio_codes = all_codes
-
-                    multimodal_outputs = {
-                        "audio_codes": audio_codes.reshape(-1),
-                        "text_codes": self._text_codes.reshape(-1) if hasattr(self, '_text_codes') and self._text_codes is not None and self._text_codes.numel() > 0 else None,
-                    }
+                # Audio codes are sampled in sample() outside CUDA graph.
+                # Return audio_logits for the runner to pass to sample().
+                self._decode_step_counter += 1
+                multimodal_outputs = {
+                    "audio_codes": torch.empty(0, dtype=torch.long),
+                    "audio_logits": audio_logits_sub,
+                    "text_codes": None,
+                }
         else:
+            # Prefill: no MIMO computation, or mimo_hidden_states not captured
+            # (non-bifurcation rank). Return empty multimodal_outputs.
             multimodal_outputs = {"audio_codes": None, "text_codes": None}
 
+        # Final return
         return OmniOutput(
             text_hidden_states=text_hidden_states,
             multimodal_outputs=multimodal_outputs,
         )
-    def compute_logits(
-        self,
-        hidden_states: torch.Tensor,
-    ) -> torch.Tensor | None:
-        """Compute text logits for the text generation path.
 
-        Uses the vLLM-native lm_head on backbone hidden states.
-        Masks the audio subspace so vLLM's sampler only selects text tokens.
-        """
-        logits = self.logits_processor(self.lm_head, hidden_states)
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: Any,
+        audio_logits: torch.Tensor | None = None,
+    ) -> None:
+        """Sample audio codes from audio logits."""
+        if audio_logits is None or audio_logits.numel() == 0:
+            return
+
+        delay_tokens = int(getattr(self.config, "kimia_mimo_audiodelaytokens", 6))
+
+        # Track sample steps independently of forward() since CUDA graph
+        # replay doesn execute Python, so _decode_step_counter stays stale.
+        step = getattr(self, "_sample_step_counter", 0)
+        self._sample_step_counter = step + 1
+
+        # Skip sampling during delay token period — output blank tokens
+        if step < delay_tokens:
+            blank_code = torch.tensor([18], device=audio_logits.device, dtype=torch.long)
+            self._audio_codes_list.append(blank_code)
+            self._audio_codes = torch.cat(self._audio_codes_list)
+            return
+
+        # Cap audio codes to prevent runaway generation
+        if len(self._audio_codes_list) >= self._max_audio_codes:
+            return
+
+        # Sample from audio logits using the same params as the reference
+        temperature = float(getattr(self.config, "kimia_audio_temperature", 0.8))
+        top_k = int(getattr(self.config, "kimia_audio_top_k", 10))
+        repetition_penalty = float(getattr(self.config, "kimia_audio_repetition_penalty", 1.0))
+
+        # Gather recent tokens for repetition penalty
+        recent_tokens = None
+        if len(self._audio_codes_list) > 0:
+            recent_tokens = torch.cat(self._audio_codes_list)
+
+        # Handle 3D logits [batch, seq, vocab] — take last position
+        if audio_logits.dim() == 3:
+            step_logits = audio_logits[:, -1, :]
+        else:
+            step_logits = audio_logits
+
+        sampled_code = _sample_audio_topk(
+            step_logits,
+            top_k=top_k,
+            temperature=temperature,
+            repetition_penalty=repetition_penalty,
+            recent_tokens=recent_tokens,
+        )
+
+        # sampled_code is [batch] or scalar — flatten to 1D
+        sampled_code = sampled_code.reshape(-1)
+
+        # Clamp to valid audio vocab range
+        audio_vocab = int(getattr(self.config, "kimia_audio_output_vocab", 16384))
+        sampled_code = sampled_code.clamp(0, audio_vocab - 1)
+
+        self._audio_codes_list.append(sampled_code)
+        self._audio_codes = torch.cat(self._audio_codes_list)
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """Compute text logits, masking audio subspace."""
+        logits = self.logits_processor(self.language_model.lm_head, hidden_states)
         if logits is not None:
-            # Mask audio subspace to prevent vLLM from sampling audio tokens.
             token_offset = int(getattr(self.config, "kimia_token_offset", 152064))
             logits[:, token_offset:] = float("-inf")
         return logits
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights with prefix-based routing and stacked param fusion.
+        """Load weights: upstream handles backbone, we handle MIMO."""
+        # Materialize the weights iterator so we can iterate it twice
+        # (once for super(), once for MIMO loading).
+        weights_list = list(weights)
 
-        Weight key routing:
-        - model.embed_tokens.* -> self.embed_tokens
-        - model.layers.{i}.* -> self.layers.{i}.* (with q/k/v→qkv, gate/up→gate_up merge)
-        - model.norm.* -> self.norm
-        - lm_head.* -> self.lm_head
-        - model.mimo_layers.{i}.* -> self.mimo_layers.{i}.* (with merge)
-        - model.mimo_norm.* -> self.mimo_norm
-        - mimo_output.* -> self.mimo_output
+        # Call upstream to load backbone + lm_head + VQAdaptor + Whisper
+        loaded = super().load_weights(iter(weights_list))
 
-        The Kimi checkpoint uses HF-format separate q_proj/k_proj/v_proj and
-        gate_proj/up_proj. These must be fused into vLLM's qkv_proj and
-        gate_up_proj via stacked_params_mapping.
-        """
+        # Load MIMO-specific weights from checkpoint if present
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
@@ -1443,76 +1255,94 @@ class KimiaAudioFusedForConditionalGeneration(
             ("gate_up_proj", "up_proj", 1),
         ]
 
-        # Collect all model parameters (names WITHOUT module prefix)
-        model_params = dict(self.named_parameters(remove_duplicate=False))
-
-        # Track which stacked params still need loading
-        stacked_shards: dict[str, dict[str, torch.Tensor]] = {}
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights_list:
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            # Route checkpoint keys to module parameter names.
-            # Checkpoint uses "model." prefix but named_parameters() returns without it.
-            # Checkpoint: "model.layers.{i}.*" → Module: "layers.{i}.*"
-            # Checkpoint: "model.mimo_layers.{i}.*" → Module: "mimo_layers.{i}.*"
-            # Checkpoint: "model.embed_tokens.*" → Module: "embed_tokens.*"
-            # Checkpoint: "model.norm.*" → Module: "norm.*"
-            # Checkpoint: "model.mimo_norm.*" → Module: "mimo_norm.*"
-            # Checkpoint: "model.lm_head.*" → Module: "lm_head.*"
-            # Checkpoint: "mimo_output.*" → Module: "mimo_output.*"
-            if name.startswith("model."):
-                param_name = name[len("model."):]
+            # Route MIMO weights
+            if "mimo_layers" not in name and "mimo_norm" not in name and "mimo_output" not in name:
+                continue
+
+            param_name = name[len("model.") :] if name.startswith("model.") else name
+
+            # Apply stacked param mapping
+            for pname, wname, sid in stacked_params_mapping:
+                if wname in param_name:
+                    param_name = param_name.replace(wname, pname)
+                    break
+
+            param = params_dict.get(param_name)
+            if param is None:
+                continue
+
+            # Check if it's a stacked param
+            is_stacked = False
+            for pname, wname, sid in stacked_params_mapping:
+                if wname in name:
+                    is_stacked = True
+                    break
+
+            if is_stacked:
+                loaded.add(param_name)
             else:
-                param_name = name
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader:
+                    weight_loader(param, loaded_weight)
+                else:
+                    param.data.copy_(loaded_weight)
+                loaded.add(param_name)
 
-            if param_name not in model_params:
-                # Check if it matches a stacked param pattern
-                is_stacked = False
-                for _, weight_name, _ in stacked_params_mapping:
-                    if weight_name in param_name:
-                        is_stacked = True
-                        break
-                if not is_stacked:
-                    continue  # Unknown param, skip
-
-            # Check stacked param mapping
-            for param_name_stem, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in param_name:
+        # Concatenate stacked shards
+        stacked_shards: dict[str, dict[str, torch.Tensor]] = {}
+        for name, loaded_weight in weights_list:
+            if "mimo_layers" not in name:
+                continue
+            param_name = name[len("model.") :] if name.startswith("model.") else name
+            for pname, wname, sid in stacked_params_mapping:
+                if wname not in param_name:
                     continue
-                mapped_name = param_name.replace(weight_name, param_name_stem)
-                if mapped_name not in model_params:
+                mapped_name = param_name.replace(wname, pname)
+                if mapped_name not in params_dict:
                     continue
-                loaded_params.add(mapped_name)
                 if mapped_name not in stacked_shards:
                     stacked_shards[mapped_name] = {}
-                stacked_shards[mapped_name][str(shard_id)] = loaded_weight
+                stacked_shards[mapped_name][str(sid)] = loaded_weight
                 break
-            else:
-                if param_name in model_params:
-                    loaded_params.add(param_name)
-                    default_weight_loader(model_params[param_name], loaded_weight)
 
-        # Concatenate stacked shards and load
         for mapped_name, shards in stacked_shards.items():
-            param = model_params[mapped_name]
-            # Extract the layer type from the mapped name.
-            # mapped_name is like "layers.0.self_attn.qkv_proj.bias" — we need "qkv_proj"
+            param = params_dict[mapped_name]
             parts = mapped_name.split(".")
-            if len(parts) >= 2:
-                key = parts[-2]  # e.g., "qkv_proj" or "gate_up_proj"
-            else:
-                key = parts[-1]
+            key = parts[-2] if len(parts) >= 2 else parts[-1]
             default_order = {"qkv_proj": ["q", "k", "v"], "gate_up_proj": ["0", "1"]}
-            if key in default_order:
-                order = default_order[key]
-            else:
-                order = sorted(shards.keys())
+            order = default_order.get(key, sorted(shards.keys()))
             sorted_shards = [shards[k] for k in order if k in shards]
             if sorted_shards:
                 concat_weight = torch.cat(sorted_shards, dim=0)
                 default_weight_loader(param, concat_weight)
 
-        return loaded_params
+        # Mark remaining MIMO params as handled (randomly initialized if not
+        # in checkpoint) so vLLM doesn't error on uninitialized weights.
+        for name in params_dict:
+            if "mimo_layers" in name or "mimo_norm" in name or "mimo_output" in name:
+                loaded.add(name)
+
+        return loaded
+
+
+# Register with vLLM's own MODEL_REGISTRY so the V1 engine can resolve
+# the architecture without falling back to TransformersForCausalLM.
+def _register_with_vllm_registry() -> None:
+    try:
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        ModelRegistry.register_model(
+            "KimiAudioFusedForConditionalGeneration",
+            "vllm_omni.model_executor.models.kimia_audio.kimia_audio_ar_stage:KimiAudioFusedForConditionalGeneration",
+        )
+    except Exception:
+        pass  # Best-effort registration; may fail in limited contexts
+
+
+_register_with_vllm_registry()
+del _register_with_vllm_registry

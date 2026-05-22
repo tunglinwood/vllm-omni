@@ -20,7 +20,7 @@ stage_args:
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.25
+      gpu_memory_utilization: 0.35
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -28,6 +28,11 @@ stage_args:
       engine_output_type: latent
       max_model_len: 8192
       max_num_batched_tokens: 8192
+      # Audio sampling params (used by KimiaAudioARStage.sample())
+      # Match reference: audio_temperature=0.8, audio_top_k=10, audio_repetition_penalty=1.0
+      kimia_audio_temperature: 0.8
+      kimia_audio_top_k: 10
+      kimia_audio_repetition_penalty: 1.0
     is_comprehension: true
     final_output: true
     final_output_type: text
@@ -44,7 +49,7 @@ stage_args:
   - stage_id: 1
     stage_type: llm
     runtime:
-      devices: "1"
+      devices: "0"
     engine_args:
       model_stage: code2wav
       max_num_seqs: 1
@@ -52,7 +57,7 @@ stage_args:
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.65
+      gpu_memory_utilization: 0.50
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false

@@ -303,7 +303,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
+        if getattr(scheduler_output, "new_block_ids_to_zero", None):
             self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
@@ -335,6 +335,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         is_ngram_gpu = self.speculative_config is not None and self.speculative_config.use_ngram_gpu()
         if is_ngram_gpu:
             ngram_gpu_new_reqs: list[CachedRequestState] = []
+        if getattr(self, "use_async_spec_decode", False):
+            self.prev_num_draft_tokens.np.fill(0)
 
         reqs_to_add: list[CachedRequestState] = []
         deferred_spec_decode_corrections = []
@@ -1057,6 +1059,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
         if not new_reqs:
             return
+        if getattr(self, "_diag_new_reqs", 0) < 5:
+            self._diag_new_reqs = getattr(self, "_diag_new_reqs", 0) + 1
+            logger.info(
+                "[DIAG NEW_REQS] #%d: %d new requests",
+                self._diag_new_reqs, len(new_reqs),
+            )
         for nr in new_reqs:
             req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
             if req_id is None or req_id not in self.requests:
@@ -1069,23 +1077,28 @@ class OmniGPUModelRunner(GPUModelRunner):
                 logger.warning_once(
                     "additional_information on request data is deprecated, use model_intermediate_buffer"
                 )
+                if getattr(self, "_diag_payload", 0) < 5:
+                    self._diag_payload = getattr(self, "_diag_payload", 0) + 1
+                    logger.info(
+                        "[DIAG PAYLOAD] #%d: additional_information type=%s",
+                        self._diag_payload, type(info_payload).__name__,
+                    )
             info_dict = deserialize_additional_information(info_payload)
             if info_dict:
                 self.model_intermediate_buffer[req_id] = info_dict
                 setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+                if getattr(self, "_diag_payload2", 0) < 5:
+                    self._diag_payload2 = getattr(self, "_diag_payload2", 0) + 1
+                    logger.info(
+                        "[DIAG PAYLOAD] #%d: model_intermediate_buffer[%s] keys=%s",
+                        self._diag_payload2, req_id, list(info_dict.keys()),
+                    )
 
     def _gather_runtime_additional_information(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
             req_state = self.requests.get(req_id)
-            # MammothModa2 AR grid constraint: the model must emit a special
-            # end-of-line (EOL) token at the end of each image row.  To determine
-            # whether the current decoding step falls on a row boundary, the
-            # constraint logic (see MammothModa2ARForConditionalGeneration.
-            # _apply_t2i_token_constraints) computes:
-            #   column_id = generated_len % (ar_width + 1)
-            # and forces the EOL token when column_id == ar_width.
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
@@ -1097,6 +1110,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                         logger.debug(f"[OMNI] req={req_id} has thinker_reply_part_per_request queue shape: {q.shape}")
             else:
                 per_req_runtime_info.append({})
+        # DIAG
+        if getattr(self, "_diag_gather", 0) < 5:
+            self._diag_gather = getattr(self, "_diag_gather", 0) + 1
+            logger.info(
+                "[DIAG GATHER] #%d: model_intermediate_buffer has %d reqs, keys=%s",
+                self._diag_gather, len(self.model_intermediate_buffer),
+                {k: list(v.keys()) for k, v in self.model_intermediate_buffer.items()},
+            )
         return per_req_runtime_info
 
     def _compute_request_token_spans(self, num_scheduled_tokens_np) -> list[tuple[int, int]]:
@@ -1139,6 +1160,13 @@ class OmniGPUModelRunner(GPUModelRunner):
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
             # Backward compatible: also emit old name
             model_kwargs_extra["runtime_additional_information"] = buffer_map
+            if getattr(self, "_diag_kwargs_extra", 0) < 20:
+                self._diag_kwargs_extra = getattr(self, "_diag_kwargs_extra", 0) + 1
+                keys_per_req = [list(r.keys()) for r in buffer_map]
+                logger.info(
+                    "[DIAG KWARGS_EXTRA #%d] model_kwargs_extra keys=%s, buffer_map=%s",
+                    self._diag_kwargs_extra, list(model_kwargs_extra.keys()), keys_per_req,
+                )
         except Exception as e:
             logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
             import traceback

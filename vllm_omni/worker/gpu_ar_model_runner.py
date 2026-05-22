@@ -561,6 +561,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # Disable CUDA graph for models that produce dynamic multimodal outputs
+        # (e.g., Kimia-Audio samples audio codes in Python forward()).
+        if getattr(self.model, "enforce_eager", False):
+            cudagraph_mode = CUDAGraphMode.NONE
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -581,7 +586,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
+                clear_metadata=not defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(
@@ -618,6 +623,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
             )
+
+            # Kimia-Audio: audio_codes are populated by model.sample() which runs
+            # in sample_tokens() after execute_model() returns. The injection
+            # happens there, not here.
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -711,6 +720,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
+        multimodal_outputs: Any = None,
     ):
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -727,9 +737,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
+                # Kimia-Audio: extract audio_logits from multimodal_outputs
+                # (returned by forward via CUDA graph replay) and pass to
+                # model.sample() for live audio code sampling.
+                audio_logits = None
+                if isinstance(multimodal_outputs, dict):
+                    audio_logits = multimodal_outputs.get("audio_logits")
                 sampler_output = model_sample(
                     logits,
                     self._sampling_metadata_for_model_sampler(sampling_metadata),
+                    audio_logits=audio_logits,
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -818,7 +835,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, spec_decode_metadata, multimodal_outputs)
+
+        # Kimia-Audio: inject live audio_codes from model.sample() into
+        # multimodal_outputs. The model's sample() method (called via _sample
+        # above) populates self._audio_codes from audio_logits.
+        if isinstance(multimodal_outputs, dict) and hasattr(self.model, "_audio_codes"):
+            live_audio_codes = getattr(self.model, "_audio_codes", None)
+            if live_audio_codes is not None and isinstance(live_audio_codes, torch.Tensor) and live_audio_codes.numel() > 0:
+                multimodal_outputs["audio_codes"] = live_audio_codes
+            # Clean up internal audio_logits key — not needed downstream.
+            multimodal_outputs.pop("audio_logits", None)
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 

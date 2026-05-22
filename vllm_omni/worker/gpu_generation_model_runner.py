@@ -331,6 +331,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        # Disable CUDA graph for models that produce dynamic multimodal outputs
+        # (e.g., Kimia-Audio samples audio codes in Python forward()).
+        if getattr(self.model, "enforce_eager", False):
+            cudagraph_mode = CUDAGraphMode.NONE
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
@@ -350,7 +355,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
+                clear_metadata=not defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
@@ -799,7 +804,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             elif self.uses_xdrope_dim > 0:
                 positions = self.xdrope_positions.gpu[:, :num_tokens_padded]
             else:
-                positions = self.positions[:num_tokens_padded]
+                positions = self.positions.gpu[:num_tokens_padded]
 
             if get_pp_group().is_first_rank:
                 intermediate_tensors = None

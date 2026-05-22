@@ -289,7 +289,6 @@ class OmniRequestState(RequestState):
         if self.output_kind == RequestOutputKind.DELTA:
             for modality_key in DRAINABLE_MODALITIES:
                 self.mm_accumulated.pop(modality_key, None)
-
         return base_output
 
 
@@ -410,9 +409,18 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             # (e.g., generation stages like code2wav that produce waveforms)
             if eco.pooling_output is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+                logger.info(
+                    "[DIAG OUTPUT PROCESSOR] Capturing pooling_output for req %s, mm_type=%s, eco.pooling_output type=%s",
+                    eco.request_id, mm_type, type(eco.pooling_output).__name__,
+                )
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.
                 eco.pooling_output = None
+            else:
+                logger.info(
+                    "[DIAG OUTPUT PROCESSOR] eco.pooling_output is None for req %s",
+                    eco.request_id,
+                )
 
         return super().process_outputs(
             engine_core_outputs,

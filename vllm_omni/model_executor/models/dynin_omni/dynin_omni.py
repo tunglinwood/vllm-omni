@@ -10,8 +10,7 @@ import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
-from vllm.inputs import MultiModalDataDict
-from vllm.inputs import MultiModalInput as MultiModalInputs
+from vllm.inputs import MultiModalDataDict, MultiModalInput
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -426,7 +425,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
         self,
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
-    ) -> MultiModalInputs:
+    ) -> MultiModalInput:
         prompt = inputs.prompt
         mm_items = inputs.mm_data_items
 
@@ -467,7 +466,7 @@ class DyninOmniMultiModalProcessor(BaseMultiModalProcessor[DyninOmniProcessingIn
             )
             mm_placeholders[modality] = placeholder_ranges
 
-        return MultiModalInputs(
+        return MultiModalInput(
             type="multimodal",
             prompt_token_ids=prompt_token_ids,
             mm_kwargs=MultiModalKwargsItems(mm_kwargs_by_modality),

@@ -53,12 +53,26 @@ def fused2code2wav(
         audio_codes = output.multimodal_output.get("audio_codes")
 
         logger.info(
-            "DIAG fused2code2wav: talker_output.finished=%s, audio_codes type=%s, "
-            "audio_codes shape=%s",
+            "DIAG fused2code2wav: talker_output.finished=%s, talker_output.outputs count=%d, "
+            "output type=%s, output.multimodal_output=%s",
             talker_output.finished,
-            type(audio_codes).__name__,
-            list(audio_codes.shape) if isinstance(audio_codes, torch.Tensor) else None,
+            len(talker_output.outputs),
+            type(output).__name__,
+            output.multimodal_output,
         )
+
+        # Dump full structure for debugging
+        if output.multimodal_output is not None:
+            mm = output.multimodal_output
+            if isinstance(mm, dict):
+                logger.info("DIAG fused2code2wav: multimodal_output keys=%s", list(mm.keys()))
+                for k, v in mm.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.info("DIAG fused2code2wav:   %s: tensor shape=%s dtype=%s", k, list(v.shape), v.dtype)
+                    else:
+                        logger.info("DIAG fused2code2wav:   %s: %s", k, type(v).__name__)
+            else:
+                logger.info("DIAG fused2code2wav: multimodal_output type=%s attrs=%s", type(mm).__name__, dir(mm))
 
         if audio_codes is None or (isinstance(audio_codes, torch.Tensor) and audio_codes.numel() == 0):
             logger.warning("No audio_codes found in fused stage output, skipping.")

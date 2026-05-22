@@ -1034,7 +1034,7 @@ def _load_vocoder_weights(
 # ---------------------------------------------------------------------------
 
 
-class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
+class KimiAudioCode2WavForConditionalGeneration(nn.Module):
     """Stage-1 code2wav model for Kimi-Audio TTS.
 
     Takes audio code token IDs from the AR stage and decodes them into
@@ -1259,20 +1259,22 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
         sr_tensor = torch.tensor(self._output_sample_rate, dtype=torch.int32)
         empty = torch.zeros((0,), dtype=torch.float32)
 
+        # Skip heavy DiT/vocoder during CUDA graph capture.
+        # The DiT/vocoder pipeline has graph-incompatible operations (.cpu(),
+        # .item(), torch.cuda.synchronize()) that break stream capture.
         if input_ids is None or input_ids.numel() == 0:
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
             )
 
-        # Flatten and filter valid codes.
-        # Input codes come from the AR stage with token_offset added (152064-168447 range).
-        # We need to subtract the offset to get the actual audio codes [0, 16383].
-        num_codes = input_ids.shape[0]
-        is_profile_run = num_codes > 1000
-
-        if is_profile_run:
-            # Skip heavy DiT/vocoder during memory profiling runs
+        # During dummy/warmup runs, sampling_metadata is not passed in kwargs.
+        # During CUDA graph capture, .cpu()/.item() operations break stream capture.
+        is_dummy_run = "sampling_metadata" not in kwargs
+        if is_dummy_run or torch.cuda.is_current_stream_capturing():
+            # Skip heavy DiT/vocoder during dummy/warmup runs, CUDA graph
+            # capture. Dummy runs are detected by absence of sampling_metadata
+            # in kwargs; capture is detected via stream state.
             return OmniOutput(
                 text_hidden_states=None,
                 multimodal_outputs={"model_outputs": [empty], "sr": [sr_tensor]},
@@ -1320,12 +1322,38 @@ class KimiaAudioCode2WavForConditionalGeneration(nn.Module):
             # Each audio code -> 4 mel frames -> 4*480=1920 audio samples.
             audio_codes = audio_codes.repeat_interleave(4, dim=1)
 
-            self._reference_detokenizer.clear_all_states()
-            mel = self._reference_detokenizer.infer_mel(
-                semantic_tokens=audio_codes.squeeze(0),
-                ode_steps=30,
-                chunk_size=30,
-            )
+            # The DiT model's RoPE embedding has max_position_embeddings=4096.
+            # When start_position_id + chunk_size exceeds 4096, the RoPE table
+            # indexing goes out of bounds (CUDA gather kernel index out of bounds).
+            # Chunk the input into segments that each fit within the position limit.
+            # With chunk_size=30, max segments = 4096 // 30 = 136 chunks = 4080 tokens.
+            # Use 4000 for safety margin.
+            _MAX_DIT_POSITIONS = 4000
+            total_tokens = audio_codes.shape[1]
+            num_segments = (total_tokens + _MAX_DIT_POSITIONS - 1) // _MAX_DIT_POSITIONS
+
+            mel_segments = []
+            for seg_idx in range(num_segments):
+                seg_start = seg_idx * _MAX_DIT_POSITIONS
+                seg_end = min(seg_start + _MAX_DIT_POSITIONS, total_tokens)
+                seg_codes = audio_codes[:, seg_start:seg_end]
+
+                logger.info(
+                    "Kimia-Audio code2wav: processing segment %d/%d, tokens [%d:%d] (%d tokens)",
+                    seg_idx + 1, num_segments, seg_start, seg_end, seg_codes.shape[1],
+                )
+
+                self._reference_detokenizer.clear_all_states()
+                seg_mel = self._reference_detokenizer.infer_mel(
+                    semantic_tokens=seg_codes.squeeze(0),
+                    ode_steps=30,
+                    chunk_size=30,
+                )
+                mel_segments.append(seg_mel)
+
+            # Concatenate mel segments: each is [T, 80]
+            mel = torch.cat(mel_segments, dim=0)
+
             # mel: [T, 80] -> [B, 80, T], convert to float32 for vocoder
             mel = mel.transpose(0, 1).unsqueeze(0).float()  # [T,80] -> [80,T] -> [B,80,T]
             waveform = self._vocoder(mel)

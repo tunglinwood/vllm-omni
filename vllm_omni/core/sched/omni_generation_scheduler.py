@@ -42,6 +42,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         super().__init__(*args, **kwargs)
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
+        self.needs_kv_cache_zeroing = False
         if getattr(model_config, "async_chunk", False):
             self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
         self._pending_finish_reqs: list[Request] = []
@@ -276,10 +277,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.prev_step_scheduled_req_ids.clear()
         self.prev_step_scheduled_req_ids.update(num_scheduled_tokens.keys())
 
-        new_block_ids_to_zero = (
-            (self.kv_cache_manager.take_new_block_ids() or None) if self.needs_kv_cache_zeroing else None
-        )
-
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -291,7 +288,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             preempted_req_ids=set(),
-            new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
         # KVTransfer: package metadata

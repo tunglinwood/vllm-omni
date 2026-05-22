@@ -81,6 +81,15 @@ class StageEngineCoreProc(EngineCoreProc):
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
 
+        # Register vLLM-Omni models in the subprocess so the V1 engine
+        # can resolve architectures like KimiAudioFusedForConditionalGeneration
+        # instead of falling back to TransformersForCausalLM.
+        try:
+            from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
+            register_omni_models_to_vllm()
+        except Exception:
+            pass  # Best-effort; models may already be registered
+
         engine_core: StageEngineCoreProc | None = None
         coord_client: OmniCoordClientForStage | None = None
         try:
