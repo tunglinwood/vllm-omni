@@ -24,6 +24,7 @@ stage_args:
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
+      attention_backend: FLASH_ATTN
       engine_output_type: latent
       max_model_len: 8192
       max_num_batched_tokens: 8192
@@ -31,19 +32,19 @@ stage_args:
     final_output: true
     final_output_type: text
     default_sampling_params:
-      temperature: 0.6
-      top_p: 0.95
-      top_k: 50
+      temperature: 0.0
+      top_k: 5
       max_tokens: 2048
       seed: 42
       detokenize: true
-      repetition_penalty: 1.1
-      ignore_eos: true
+      repetition_penalty: 1.0
+      ignore_eos: false
+      stop_token_ids: [151667]
 
   - stage_id: 1
     stage_type: llm
     runtime:
-      devices: "0"
+      devices: "1"
     engine_args:
       model_stage: code2wav
       max_num_seqs: 1
@@ -51,10 +52,11 @@ stage_args:
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       tensor_parallel_size: 1
-      gpu_memory_utilization: 0.25
+      gpu_memory_utilization: 0.65
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
+      attention_backend: FLASH_ATTN
       engine_output_type: audio
       max_model_len: 8192
       max_num_batched_tokens: 8192
