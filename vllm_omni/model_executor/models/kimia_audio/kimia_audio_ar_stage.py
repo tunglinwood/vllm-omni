@@ -1082,6 +1082,24 @@ class KimiAudioFusedForConditionalGeneration(
         # runs on newly generated audio codes and attends to both prefill cache
         # entries and previously generated codes.
         if mimo_hidden_states is not None:
+            # Compute MIMO-specific position IDs. During prefill, MIMO processes
+            # audio positions [0, audio_len-1] and populates its KV cache at those
+            # positions. During decode, the backbone uses text token positions
+            # (e.g., audio_len+1, audio_len+2, ...) but MIMO should generate audio
+            # codes at positions [audio_len, audio_len+1, ...] — i.e., continuing
+            # from the prefill audio positions. Using backbone positions directly
+            # causes RoPE mismatch: MIMO attention queries wrong relative positions.
+            audio_offset = getattr(self, "_prefill_audio_offset", 0)
+            decode_step = getattr(self, "_decode_step_counter", 0)
+            if not is_prefill and audio_offset > 0:
+                # Decode: single audio code at position audio_offset + decode_step
+                mimo_positions = positions.new_full(
+                    (positions.shape[0],), audio_offset + decode_step
+                )
+            else:
+                # Prefill: use backbone positions (audio positions 0..audio_len-1)
+                mimo_positions = positions
+
             # === CAPTURE HOOK: save MIMO layer I/O for debugging ===
             _capture_mimo = os.environ.get("CAPTURE_MIMO", "0") == "1"
             _mimo_capture_dir = os.environ.get("CAPTURE_MIMO_DIR", "/tmp/mimo_capture")
@@ -1093,9 +1111,9 @@ class KimiAudioFusedForConditionalGeneration(
                     torch.save({
                         "input": mimo_hidden_states.detach().float().cpu(),
                         "residual": mimo_residual.detach().float().cpu() if mimo_residual is not None else None,
-                        "positions": positions.detach().cpu(),
+                        "positions": mimo_positions.detach().cpu(),
                     }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_input.pt"))
-                mimo_hidden_states, mimo_residual = mimo_layer(positions, mimo_hidden_states, mimo_residual)
+                mimo_hidden_states, mimo_residual = mimo_layer(mimo_positions, mimo_hidden_states, mimo_residual)
                 if _capture_mimo:
                     torch.save({
                         "output": mimo_hidden_states.detach().float().cpu(),
@@ -1116,7 +1134,6 @@ class KimiAudioFusedForConditionalGeneration(
                 torch.save({
                     "mimo_logits": audio_logits_out.detach().float().cpu() if isinstance(audio_logits_out, torch.Tensor) else audio_logits_out[0].detach().float().cpu(),
                 }, os.path.join(_mimo_capture_dir, "mimo_logits.pt"))
-            audio_logits_out = self.mimo_output(mimo_hidden_states)
             if isinstance(audio_logits_out, tuple):
                 audio_logits = audio_logits_out[0]
             else:
