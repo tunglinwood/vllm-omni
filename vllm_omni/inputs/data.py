@@ -16,7 +16,7 @@ except ImportError:
 
 
 import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokenInputs, TokensPrompt
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
 
 
 class OmniTextPrompt(TextPrompt):
@@ -59,10 +59,10 @@ class OmniTokensPrompt(TokensPrompt):
     additional_information: NotRequired[dict[str, Any]]
 
 
-class OmniTokenInputs(TokenInputs):
+class OmniTokensInput(TokensInput):
     """Token inputs with optional embeddings and additional information.
 
-    Extends TokenInputs to support prompt embeddings and additional
+    Extends TokensInput to support prompt embeddings and additional
     information payloads for direct transfer between pipeline stages.
 
     Attributes:
@@ -139,10 +139,10 @@ def token_inputs_omni(
     cache_salt: str | None = None,
     prompt_embeds: torch.Tensor | None = None,
     additional_information: dict[str, Any] | None = None,
-) -> OmniTokenInputs:
+) -> OmniTokensInput:
     """Construct token inputs with optional embeddings and metadata.
 
-    Creates an OmniTokenInputs object with token IDs and optional
+    Creates an OmniTokensInput object with token IDs and optional
     embeddings and additional information for pipeline stage transfer.
 
     Args:
@@ -154,9 +154,9 @@ def token_inputs_omni(
             information (tensors or lists)
 
     Returns:
-        OmniTokenInputs instance with the provided data
+        OmniTokensInput instance with the provided data
     """
-    inputs = OmniTokenInputs(type="token", prompt_token_ids=prompt_token_ids)
+    inputs = OmniTokensInput(type="token", prompt_token_ids=prompt_token_ids)
 
     if prompt is not None:
         inputs["prompt"] = prompt

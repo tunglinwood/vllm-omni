@@ -9,7 +9,7 @@ from vllm.renderers.inputs import SingletonDictPrompt
 from vllm_omni.inputs.data import (
     OmniEmbedsPrompt,
     OmniTextPrompt,
-    OmniTokenInputs,
+    OmniTokensInput,
     OmniTokensPrompt,
     token_inputs_omni,
 )
@@ -137,9 +137,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        *,
-        mm_uuids: Any | None = None,
-    ) -> OmniTokenInputs | MultiModalInput:
+    ) -> OmniTokensInput | MultiModalInput:
         """Process text prompts with support for mm_processor_kwargs.
 
         Extends base class to support mm_processor_kwargs without multi_modal_data.
@@ -161,7 +159,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         additional_information = parsed_content.get("additional_information")
         whisper_feature = _extract_whisper_feature(additional_information)
 
-        inputs: OmniTokenInputs | MultiModalInput
+        inputs: OmniTokensInput | MultiModalInput
         if multi_modal_data := parsed_content.get("multi_modal_data"):
             inputs = self._process_multimodal(
                 prompt_text,
@@ -228,7 +226,7 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTokensPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-    ) -> OmniTokenInputs | MultiModalInput:
+    ) -> OmniTokensInput | MultiModalInput:
         prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
@@ -245,7 +243,7 @@ class OmniInputPreprocessor(InputPreprocessor):
             and KIMIA_MEDIA_END in prompt_token_ids
         )
 
-        inputs: OmniTokenInputs | MultiModalInput
+        inputs: OmniTokensInput | MultiModalInput
         if multi_modal_data:
             inputs = self._process_multimodal(
                 prompt_token_ids,
