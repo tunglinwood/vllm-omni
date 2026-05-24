@@ -96,6 +96,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Output placeholders are zero when async scheduling isn't used
         return request.num_computed_tokens - request.num_output_placeholders
 
+        # Temporary storage for pooler_output accessible during _update_request_with_output
+        self._pending_pooler_outputs: dict[str, Any] = {}
+
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
         if not hasattr(self, "vllm_config"):
@@ -129,6 +132,44 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         self._omits_kv_transfer_cache[rid] = result
         return result
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        """Override: detect audio continuation and suppress text EOS stop.
+
+        When text generation finishes (EOS) but audio codes are still being
+        generated, keep the request alive so audio generation can continue.
+        This decouples audio generation from text generation length.
+        """
+        # Call parent for standard token appending and stop detection
+        new_token_ids, stopped = super()._update_request_with_output(
+            request, new_token_ids
+        )
+
+        if not stopped:
+            return new_token_ids, stopped
+
+        # Check if this is an audio request with active audio generation.
+        # Use pooler_output — if it has audio_codes, it's a Kimia audio request.
+        pooler_output = self._pending_pooler_outputs.get(request.request_id)
+        if not pooler_output or not isinstance(pooler_output, dict):
+            return new_token_ids, stopped
+
+        ac = pooler_output.get("audio_codes")
+        if ac is None:
+            return new_token_ids, stopped
+
+        audio_code_count = ac.numel() if hasattr(ac, "numel") else (len(ac) if ac else 0)
+        max_codes = 80  # match reference ~77 codes (~6.16s at 12.5 codes/sec)
+
+        if audio_code_count > 0 and audio_code_count < max_codes:
+            # Audio still generating — keep request alive, trim post-EOS tokens
+            request.status = RequestStatus.RUNNING
+            return [], False
+
+        # No audio, audio finished (max_codes), or audio EOS — stop as normal
+        return new_token_ids, stopped
 
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
@@ -401,7 +442,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Check for stop and update request status.
             if new_token_ids:
+                # Store pooler_output temporarily so _update_request_with_output
+                # can access it for audio continuation detection
+                if pooler_output:
+                    self._pending_pooler_outputs[req_id] = pooler_output
                 new_token_ids, stopped = self._update_request_with_output(request, new_token_ids)
+                self._pending_pooler_outputs.pop(req_id, None)
             elif request.pooling_params and pooler_output is not None:
                 # Pooling stops as soon as there is output.
                 request.status = RequestStatus.FINISHED_STOPPED

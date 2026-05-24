@@ -28,8 +28,6 @@ stage_args:
       engine_output_type: latent
       max_model_len: 8192
       max_num_batched_tokens: 8192
-      # Audio sampling params (used by KimiaAudioARStage.sample())
-      # Match reference: audio_temperature=0.8, audio_top_k=10, audio_repetition_penalty=1.0
       kimia_audio_temperature: 0.8
       kimia_audio_top_k: 10
       kimia_audio_repetition_penalty: 1.0

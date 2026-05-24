@@ -93,7 +93,14 @@ class OmniRequestState(RequestState):
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
-                        if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
+                        # audio_codes is already cumulative (model._audio_codes
+                        # contains ALL codes generated so far). Replacing on
+                        # each step avoids concatenating duplicate accumulations
+                        # (e.g., 1+2+3+...+19=190 instead of 19).
+                        if k == "audio_codes":
+                            self.mm_accumulated[k] = v
+                        elif isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
+                            # Use list accumulation to avoid O(n²) repeated concatenation
                             self.mm_accumulated[k] = [existing, v]
                         elif isinstance(v, torch.Tensor) and isinstance(existing, list):
                             existing.append(v)

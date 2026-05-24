@@ -70,10 +70,12 @@ def _sample_audio_topk(
     Returns:
         Sampled token IDs with same batch/seq shape as input logits minus vocab dim.
     """
-    # Apply repetition penalty — start penalizing as soon as we have any
-    # recent tokens. The reference model avoids repeating audio codes in
-    # quick succession, which is critical for natural-sounding TTS.
-    if repetition_penalty > 1.0 and recent_tokens is not None and recent_tokens.numel() > 0:
+    # Apply repetition penalty — match reference: only activate after we have
+    # more tokens than the repetition window. The reference KimiASampler checks
+    # `len(recent_tokens) > audio_repetition_window_size` (64), which means
+    # the penalty doesn't kick in until enough audio codes have been generated.
+    # Applying it too early reduces diversity and causes repetitive audio.
+    if repetition_penalty > 1.0 and recent_tokens is not None and recent_tokens.numel() > repetition_window:
         # Use up to repetition_window most recent tokens for penalty
         n = min(recent_tokens.numel(), repetition_window)
         window_tokens = recent_tokens[-n:].long().to(logits.device)
@@ -506,10 +508,34 @@ class KimiAudioFusedForConditionalGeneration(
         self._text_codes_list: list[torch.Tensor] = []
         self._text_codes: torch.Tensor | None = None
 
-        # Cap audio codes to prevent runaway generation
+        # Cap audio codes to prevent runaway generation.
+        # The reference model uses max_new_tokens = int(12.5 * 120) - input_codes
+        # which limits total audio to ~12.5 seconds. At ~75 codes/sec (reference
+        # rate), that's ~937 total codes. We use 1000 as a safe upper bound.
         self._max_audio_codes: int = int(
-            getattr(self.config, "kimia_max_audio_codes", 3000),
+            getattr(self.config, "kimia_max_audio_codes", 1000),
         )
+
+        # Audio EOS tokens — when the model predicts one of these, stop
+        # generating audio codes (same as reference eod_ids check).
+        # Reference: eod_ids = [msg_end, media_end]
+        self._audio_eod_ids: set[int] = set()
+        # media_end from config
+        if hasattr(self.config, "kimia_media_end"):
+            self._audio_eod_ids.add(int(self.config.kimia_media_end))
+        # msg_end: same as eos_token_id[1] in Kimia config
+        if hasattr(self.config, "eos_token_ids"):
+            eos_ids = self.config.eos_token_ids
+            if isinstance(eos_ids, list):
+                for eid in eos_ids:
+                    self._audio_eod_ids.add(int(eid))
+            else:
+                self._audio_eod_ids.add(int(eos_ids))
+        # Fallback: hardcode known token IDs if config keys missing
+        if not self._audio_eod_ids:
+            self._audio_eod_ids = {151645, 151663}  # msg_end, media_end
+
+        self._audio_eos_triggered: bool = False
 
         # Per-request Whisper features from user input audio (S2S mode)
         self._input_whisper_emb: torch.Tensor | None = None
@@ -802,7 +828,32 @@ class KimiAudioFusedForConditionalGeneration(
             decode_step = getattr(self, "_decode_step_counter", 0)
             use_delay_blank = decode_step < delay_tokens
 
-            text_embed = embed_tokens_fn(input_ids)
+            # After text EOS, vLLM feeds back the EOS token as input_ids during
+            # audio-only decode steps. The reference model explicitly uses the
+            # blank token (kimia_text_blank = 151666) instead. The model was
+            # trained with blank tokens during audio-only decode, so feeding the
+            # wrong token corrupts the combined embedding (audio_embed + text_embed)
+            # that goes through the backbone to the MIMO layers.
+            # Detect audio-only decode: audio codes have been generated AND the
+            # current input_ids is specifically a text EOS token (not just any text).
+            text_blank_index = int(getattr(self.config, "kimia_text_blank_index", 151666))
+            is_audio_only_decode = False
+            if not use_delay_blank and torch.cuda.is_current_stream_capturing() is False:
+                if hasattr(self, "_audio_codes_list") and len(self._audio_codes_list) > 0:
+                    last_id = input_ids.reshape(-1)[-1].item()
+                    # Check if input is one of the text EOS tokens. During mixed
+                    # decode, input is a meaningful text token (varies each step).
+                    # After text EOS, input becomes the EOS token (repeated each step).
+                    _text_eos_ids = {151667, 151645, 151663}  # assistant_turn, msg_end, media_end
+                    if last_id in _text_eos_ids:
+                        is_audio_only_decode = True
+
+            if is_audio_only_decode:
+                # Use blank token for text embedding, matching reference model
+                text_ids = torch.full_like(input_ids, text_blank_index)
+                text_embed = embed_tokens_fn(text_ids)
+            else:
+                text_embed = embed_tokens_fn(input_ids)
 
             if use_delay_blank:
                 audio_blank_index = 18
@@ -864,10 +915,12 @@ class KimiAudioFusedForConditionalGeneration(
                     is_continuous_mask = torch.zeros(seq_len, dtype=torch.bool, device=input_ids.device)
                     is_continuous_mask[mb_pos[0].item() + 1 : me_pos[0].item()] = True
                 else:
-                    self._prefill_audio_offset = seq_len
+                    # No media_begin/media_end tokens found — no audio to track
+                    self._prefill_audio_offset = 0
                     return audio_emb if text_emb is None else audio_emb + text_emb
             else:
-                self._prefill_audio_offset = seq_len
+                # No whisper features — no audio prefill
+                self._prefill_audio_offset = 0
                 return audio_emb if text_emb is None else audio_emb + text_emb
 
         # Inject Whisper features at audio positions
@@ -914,7 +967,15 @@ class KimiAudioFusedForConditionalGeneration(
                 torch.bool
             )
 
-            self._prefill_audio_offset = seq_len
+            # Track the actual number of audio tokens (not full seq_len).
+            # The reference model's position IDs during prefill only count audio
+            # tokens (audio_input_ids.shape[1]), not scaffolding tokens.
+            # Using full seq_len causes RoPE position mismatch during decode:
+            # reference queries position N (audio count), vLLM queries N+6
+            # (seq_len including scaffolding), causing MIMO to attend to wrong
+            # KV cache entries and produce incorrect audio logits.
+            audio_token_count = is_continuous_mask.sum().item()
+            self._prefill_audio_offset = int(audio_token_count)
 
             if getattr(self, "_decode_whisper_frames", None) is None:
                 self._decode_whisper_frames = whisper_3584.clone()
@@ -940,8 +1001,9 @@ class KimiAudioFusedForConditionalGeneration(
 
             return audio_emb if text_emb is None else audio_emb + text_emb
 
-        # Fallback
-        self._prefill_audio_offset = seq_len
+        # Fallback: no whisper features (TTS mode or non-S2S).
+        # Set audio offset to 0 — no prefill audio tokens to account for.
+        self._prefill_audio_offset = 0
         return audio_emb if text_emb is None else audio_emb + text_emb
 
     def forward(
@@ -971,6 +1033,7 @@ class KimiAudioFusedForConditionalGeneration(
             self._decode_step_counter = 0
             self._sample_step_counter = 0
             self._audio_codes_list = []
+            self._audio_eos_triggered = False
             self._input_whisper_emb = None
             self._input_whisper_emb_logged = False
             self._input_whisper_raw = None
@@ -1029,8 +1092,18 @@ class KimiAudioFusedForConditionalGeneration(
 
         def _bifurcation_hook(module, input, output):
             nonlocal mimo_hidden_states
-            hs = output[0] if isinstance(output, tuple) else output
-            mimo_hidden_states = hs.clone()
+            # Qwen2DecoderLayer returns (hidden_states, residual) where
+            # hidden_states is the raw MLP output and residual carries the
+            # skip connection. The actual layer output is hidden_states + residual.
+            # Match the reference model's behavior where MIMO layers receive the
+            # complete layer output (mlp_out + residual), not the raw MLP output.
+            if isinstance(output, tuple) and len(output) >= 2:
+                hs = output[0]
+                res = output[1]
+                mimo_hidden_states = (hs + res).clone()
+            else:
+                hs = output[0] if isinstance(output, tuple) else output
+                mimo_hidden_states = hs.clone()
             # Capture bifurcation output for debugging
             if os.environ.get("CAPTURE_MIMO", "0") == "1":
                 capture_dir = os.environ.get("CAPTURE_MIMO_DIR", "/tmp/mimo_capture")
@@ -1038,6 +1111,13 @@ class KimiAudioFusedForConditionalGeneration(
                 torch.save({
                     "hidden_states": hs.detach().float().cpu(),
                 }, os.path.join(capture_dir, "bifurcation_output.pt"))
+            # DIAG: Log bifurcation stats
+            _log_mimo = os.environ.get("DIAG_MIMO", "0") == "1"
+            if _log_mimo:
+                _bif_std = mimo_hidden_states.float().std().item()
+                _bif_shape = list(mimo_hidden_states.shape)
+                _bif_nonzero = (mimo_hidden_states.abs() > 1e-6).sum().item()
+                logger.info(f"[BIFURC DIAG] shape={_bif_shape} std={_bif_std:.4f} nonzero={_bif_nonzero}/{mimo_hidden_states.numel()}")
 
         hook_handle = bifurcation_layer.register_forward_hook(_bifurcation_hook)
 
@@ -1081,23 +1161,26 @@ class KimiAudioFusedForConditionalGeneration(
         # context, matching the reference model's behavior. During decode, MIMO
         # runs on newly generated audio codes and attends to both prefill cache
         # entries and previously generated codes.
-        if mimo_hidden_states is not None:
-            # Compute MIMO-specific position IDs. During prefill, MIMO processes
-            # audio positions [0, audio_len-1] and populates its KV cache at those
-            # positions. During decode, the backbone uses text token positions
-            # (e.g., audio_len+1, audio_len+2, ...) but MIMO should generate audio
-            # codes at positions [audio_len, audio_len+1, ...] — i.e., continuing
-            # from the prefill audio positions. Using backbone positions directly
-            # causes RoPE mismatch: MIMO attention queries wrong relative positions.
+        # Skip during profile/warmup runs to avoid populating the KV cache
+        # with dummy (zero) values that corrupt actual inference. Also skip
+        # if the input is all-zeros (warmup decode before actual prefill).
+        _has_real_prefill = getattr(self, "_prefill_audio_offset", 0) > 0
+        if mimo_hidden_states is not None and not is_profile_run and _has_real_prefill:
+            # Use backbone position IDs for MIMO layers in both prefill and decode.
+            # The bifurcation hidden states come from backbone layer 21 at the
+            # current positions. MIMO must use the same position IDs to ensure
+            # RoPE embeddings match between the backbone and MIMO attention.
             audio_offset = getattr(self, "_prefill_audio_offset", 0)
-            decode_step = getattr(self, "_decode_step_counter", 0)
             if not is_prefill and audio_offset > 0:
-                # Decode: single audio code at position audio_offset + decode_step
-                mimo_positions = positions.new_full(
-                    (positions.shape[0],), audio_offset + decode_step
-                )
+                # Decode: use backbone position for MIMO to match RoPE embedding.
+                # The bifurcation hidden states come from backbone layer 21 at
+                # the current decode position. MIMO must use the same position
+                # IDs as the backbone to ensure RoPE consistency.
+                mimo_positions = positions
             else:
-                # Prefill: use backbone positions (audio positions 0..audio_len-1)
+                # Prefill: use backbone positions for MIMO layers.
+                # The MIMO layers process all tokens through bifurcation, but
+                # only audio token positions matter for the KV cache.
                 mimo_positions = positions
 
             # === CAPTURE HOOK: save MIMO layer I/O for debugging ===
@@ -1105,15 +1188,74 @@ class KimiAudioFusedForConditionalGeneration(
             _mimo_capture_dir = os.environ.get("CAPTURE_MIMO_DIR", "/tmp/mimo_capture")
             if _capture_mimo:
                 os.makedirs(_mimo_capture_dir, exist_ok=True)
-            mimo_residual = None
             for layer_idx, mimo_layer in enumerate(self.mimo_layers):
+                # Pass None as residual to match reference model behavior.
+                # The reference creates a fresh residual from each layer's
+                # input (residual = hidden_states before norm). vLLM's fused
+                # residual carrying pattern accumulates residuals across layers,
+                # which changes the norm statistics and produces different output.
+                # With residual=None, Qwen2DecoderLayer does:
+                #   residual = hidden_states (this layer's own input)
+                #   hidden_states = input_layernorm(hidden_states)
+                #   hidden_states = self_attn(hidden_states)
+                #   hidden_states, residual = post_attention_layernorm(hidden_states, residual)
+                #   hidden_states = mlp(hidden_states)
+                #   return hidden_states, residual
+                # This matches the reference: output = mlp(attn(norm(input))) + input
+                # Pass None as residual to match reference model behavior.
+                # The reference creates a fresh residual from each layer's
+                # input (residual = hidden_states before norm). vLLM's fused
+                # residual carrying pattern accumulates residuals across layers,
+                # which changes the norm statistics and produces different output.
                 if _capture_mimo:
                     torch.save({
                         "input": mimo_hidden_states.detach().float().cpu(),
-                        "residual": mimo_residual.detach().float().cpu() if mimo_residual is not None else None,
                         "positions": mimo_positions.detach().cpu(),
                     }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_input.pt"))
-                mimo_hidden_states, mimo_residual = mimo_layer(mimo_positions, mimo_hidden_states, mimo_residual)
+
+                # DIAG: Log MIMO layer stats for both prefill and decode
+                _log_mimo = os.environ.get("DIAG_MIMO", "0") == "1"
+                if _log_mimo and layer_idx == 0:
+                    _mimo_in_std = mimo_hidden_states.float().std().item()
+                    _mimo_in_mean = mimo_hidden_states.float().mean().item()
+                    _mimo_shape = list(mimo_hidden_states.shape)
+                    _mimo_nonzero = (mimo_hidden_states.abs() > 1e-6).sum().item()
+                    _mimo_total = mimo_hidden_states.numel()
+                    logger.info(f"[MIMO DIAG] prefill={is_prefill} layer={layer_idx} shape={_mimo_shape} input_std={_mimo_in_std:.4f} nonzero={_mimo_nonzero}/{_mimo_total}")
+
+                # Granular capture: hook self_attn and mlp outputs
+                if _capture_mimo:
+                    _orig_attn = mimo_layer.self_attn.forward
+                    _orig_mlp = mimo_layer.mlp.forward
+                    def _wrapped_attn(*args, **kwargs):
+                        out = _orig_attn(*args, **kwargs)
+                        torch.save({
+                            "attn_output": out.detach().float().cpu(),
+                            "positions": mimo_positions.detach().cpu(),
+                        }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_attn_output.pt"))
+                        return out
+                    def _wrapped_mlp(*args, **kwargs):
+                        out = _orig_mlp(*args, **kwargs)
+                        torch.save({
+                            "mlp_output": out.detach().float().cpu(),
+                        }, os.path.join(_mimo_capture_dir, f"mimo_layer_{layer_idx}_mlp_output.pt"))
+                        return out
+                    mimo_layer.self_attn.forward = _wrapped_attn
+                    mimo_layer.mlp.forward = _wrapped_mlp
+
+                mimo_hidden_states, _ = mimo_layer(mimo_positions, mimo_hidden_states, None)
+
+                # DIAG: Log output stats
+                if _log_mimo:
+                    _mimo_out_std = mimo_hidden_states.float().std().item()
+                    _mimo_out_mean = mimo_hidden_states.float().mean().item()
+                    logger.info(f"[MIMO DIAG] prefill={is_prefill} layer={layer_idx} output_std={_mimo_out_std:.4f} output_mean={_mimo_out_mean:.6f}")
+
+                # Restore original forward
+                if _capture_mimo:
+                    mimo_layer.self_attn.forward = _orig_attn
+                    mimo_layer.mlp.forward = _orig_mlp
+
                 if _capture_mimo:
                     torch.save({
                         "output": mimo_hidden_states.detach().float().cpu(),
@@ -1139,13 +1281,20 @@ class KimiAudioFusedForConditionalGeneration(
             else:
                 audio_logits = audio_logits_out
 
+            # Extract audio logits subspace (audio codes only, starting at
+            # token_offset). The reference model stops on EOS tokens but those
+            # are in the text vocab space and never have high probability in
+            # the audio logits — use _max_audio_codes cap instead.
             audio_vocab = int(getattr(self.config, "kimia_audio_output_vocab", 16384))
             if audio_logits.dim() == 2:
-                audio_logits_sub = audio_logits[:, token_offset : token_offset + audio_vocab]
+                audio_logits_sub = audio_logits[:, token_offset : token_offset + audio_vocab]  # [batch, audio_vocab]
             elif audio_logits.dim() == 3:
-                audio_logits_sub = audio_logits[:, :, token_offset : token_offset + audio_vocab]
+                audio_logits_sub = audio_logits[:, :, token_offset : token_offset + audio_vocab]  # [batch, seq, audio_vocab]
             else:
                 raise ValueError(f"Unexpected audio_logits dim: {audio_logits.dim()}, shape: {audio_logits.shape}")
+
+            # Store full unsliced logits for audio EOS detection in sample()
+            self._full_audio_logits = audio_logits
 
             # Return audio_logits via multimodal_outputs so they are
             # updated during CUDA graph replay (return values are part of
@@ -1159,6 +1308,7 @@ class KimiAudioFusedForConditionalGeneration(
                 self._decode_step_counter = 0
                 self._sample_step_counter = 0
                 self._text_codes = torch.empty(0, dtype=torch.long)
+                self._full_audio_logits = None
                 multimodal_outputs = {
                     "audio_codes": torch.empty(0, dtype=torch.long),
                     "audio_logits": audio_logits_sub,
@@ -1167,7 +1317,11 @@ class KimiAudioFusedForConditionalGeneration(
             else:
                 # Audio codes are sampled in sample() outside CUDA graph.
                 # Return audio_logits for the runner to pass to sample().
-                self._decode_step_counter += 1
+                # Only increment during decode, not prefill — prefill populates
+                # the KV cache at positions [0, ..., _prefill_seq_len-1], and
+                # decode should start at position _prefill_seq_len (not +1).
+                if not is_prefill:
+                    self._decode_step_counter += 1
                 multimodal_outputs = {
                     "audio_codes": torch.empty(0, dtype=torch.long),
                     "audio_logits": audio_logits_sub,
@@ -1201,15 +1355,47 @@ class KimiAudioFusedForConditionalGeneration(
         step = getattr(self, "_sample_step_counter", 0)
         self._sample_step_counter = step + 1
 
-        # Skip sampling during delay token period — output blank tokens
+        # Skip sampling during delay token period — the reference model does
+        # NOT include delay blank codes in the output (slices them out via
+        # previous_audio_tokens[audio_delay_tokens:audio_delay_tokens+valid_length]).
+        # Don't append blank codes to the output list.
         if step < delay_tokens:
-            blank_code = torch.tensor([18], device=audio_logits.device, dtype=torch.long)
-            self._audio_codes_list.append(blank_code)
-            self._audio_codes = torch.cat(self._audio_codes_list)
             return
 
-        # Cap audio codes to prevent runaway generation
+        # Check max codes BEFORE sampling — the reference model stops appending
+        # audio codes once the limit is reached. If we sample first then check,
+        # _audio_codes will exceed the limit and the scheduler will read the
+        # inflated count, causing extra decode steps.
         if len(self._audio_codes_list) >= self._max_audio_codes:
+            return
+
+        # Check for audio EOS — if the model predicted an EOD token in the
+        # full logits, stop generating audio codes (same as reference eod_ids
+        # check: audio_stream_is_finished = next_audio_token.item() in eod_ids).
+        if not getattr(self, "_audio_eos_triggered", False):
+            full_logits = getattr(self, "_full_audio_logits", None)
+            if full_logits is not None:
+                # Take last position: [batch, vocab] or [vocab]
+                if full_logits.dim() == 3:
+                    last_logits = full_logits[:, -1, :]
+                elif full_logits.dim() == 2:
+                    last_logits = full_logits
+                else:
+                    last_logits = full_logits.view(1, -1)
+
+                # Check if argmax is an EOD token
+                top_token = last_logits.argmax(dim=-1).item()
+                if top_token in self._audio_eod_ids:
+                    logger.info(
+                        f"[Kimia-Audio] EOS triggered at step {step}: "
+                        f"top_token={top_token} in eod_ids={self._audio_eod_ids}, "
+                        f"generated {len(self._audio_codes_list)} audio codes"
+                    )
+                    self._audio_eos_triggered = True
+                    return
+
+        # Stop generating if EOS was triggered
+        if getattr(self, "_audio_eos_triggered", False):
             return
 
         # Sample from audio logits using the same params as the reference
@@ -1228,6 +1414,20 @@ class KimiAudioFusedForConditionalGeneration(
         else:
             step_logits = audio_logits
 
+        # DIAG: Log audio logits distribution statistics at key steps
+        _diag_logits = os.environ.get("DIAG_MIMO", "0") == "1"
+        if _diag_logits:
+            _logits_fp32 = step_logits.float()
+            _logits_shape = list(_logits_fp32.shape)
+            _top5_vals, _top5_idx = torch.topk(_logits_fp32, 5, dim=-1)
+            _logits_std = _logits_fp32.std().item()
+            _logits_entropy = -torch.softmax(_logits_fp32, dim=-1) * torch.log_softmax(_logits_fp32, dim=-1)
+            _entropy_val = _logits_entropy.sum(dim=-1).item()
+            logger.info(
+                f"[LOGITS DIAG] step={step+1} shape={_logits_shape} logits_std={_logits_std:.2f} entropy={_entropy_val:.2f} "
+                f"top5_codes={_top5_idx[0].tolist()} top5_vals={_top5_vals[0].tolist()}"
+            )
+
         sampled_code = _sample_audio_topk(
             step_logits,
             top_k=top_k,
@@ -1235,6 +1435,9 @@ class KimiAudioFusedForConditionalGeneration(
             repetition_penalty=repetition_penalty,
             recent_tokens=recent_tokens,
         )
+
+        if _diag_logits:
+            logger.info(f"[LOGITS DIAG] step={step+1} sampled_code={sampled_code.item()}")
 
         # sampled_code is [batch] or scalar — flatten to 1D
         sampled_code = sampled_code.reshape(-1)
@@ -1245,6 +1448,13 @@ class KimiAudioFusedForConditionalGeneration(
 
         self._audio_codes_list.append(sampled_code)
         self._audio_codes = torch.cat(self._audio_codes_list)
+
+        # Log audio code diversity at key intervals
+        n = len(self._audio_codes_list)
+        if n <= 3 or n % 20 == 0 or n >= 78:
+            codes_list = [c.item() for c in self._audio_codes_list]
+            unique = len(set(codes_list))
+            logger.info(f"[AUDIO CODES] step={n}: unique={unique}/{n}, last5={codes_list[-5:]}")
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """Compute text logits, masking audio subspace."""
@@ -1272,49 +1482,58 @@ class KimiAudioFusedForConditionalGeneration(
             ("gate_up_proj", "up_proj", 1),
         ]
 
+        def _is_stacked_key(name):
+            for _, wname, _ in stacked_params_mapping:
+                if wname in name:
+                    return True
+            return False
+
         params_dict = dict(self.named_parameters())
+
+        # Pass 1: Load non-stacked MIMO params (layernorms, o_proj, down_proj,
+        # biases). Skip stacked params — they are handled in Pass 2.
         for name, loaded_weight in weights_list:
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            # Route MIMO weights
             if "mimo_layers" not in name and "mimo_norm" not in name and "mimo_output" not in name:
                 continue
 
+            # Strip "model." prefix — most checkpoint keys have it but vLLM
+            # params_dict may not. Some keys (like mimo_output.weight) lack the
+            # prefix in the checkpoint but have it in vLLM params.
             param_name = name[len("model.") :] if name.startswith("model.") else name
 
-            # Apply stacked param mapping
-            for pname, wname, sid in stacked_params_mapping:
-                if wname in param_name:
-                    param_name = param_name.replace(wname, pname)
-                    break
+            # Skip stacked params — collected and concatenated in Pass 2
+            if _is_stacked_key(name):
+                continue
 
+            # Try with and without "model." prefix
             param = params_dict.get(param_name)
+            if param is None and not param_name.startswith("model."):
+                param = params_dict.get(f"model.{param_name}")
+                if param is not None:
+                    param_name = f"model.{param_name}"
             if param is None:
                 continue
 
-            # Check if it's a stacked param
-            is_stacked = False
-            for pname, wname, sid in stacked_params_mapping:
-                if wname in name:
-                    is_stacked = True
-                    break
-
-            if is_stacked:
-                loaded.add(param_name)
+            weight_loader = getattr(param, "weight_loader", None)
+            if weight_loader:
+                weight_loader(param, loaded_weight)
             else:
-                weight_loader = getattr(param, "weight_loader", None)
-                if weight_loader:
-                    weight_loader(param, loaded_weight)
-                else:
-                    param.data.copy_(loaded_weight)
-                loaded.add(param_name)
+                param.data.copy_(loaded_weight)
+            loaded.add(param_name)
 
-        # Concatenate stacked shards
+        # Pass 2: Collect and concatenate stacked MIMO param shards (q/k/v →
+        # qkv_proj, gate/up → gate_up_proj)
         stacked_shards: dict[str, dict[str, torch.Tensor]] = {}
         for name, loaded_weight in weights_list:
             if "mimo_layers" not in name:
                 continue
+            if not _is_stacked_key(name):
+                continue
+
+            # Strip "model." prefix — checkpoint keys have it but vLLM
+            # params_dict doesn't
             param_name = name[len("model.") :] if name.startswith("model.") else name
             for pname, wname, sid in stacked_params_mapping:
                 if wname not in param_name:
@@ -1336,7 +1555,12 @@ class KimiAudioFusedForConditionalGeneration(
             sorted_shards = [shards[k] for k in order if k in shards]
             if sorted_shards:
                 concat_weight = torch.cat(sorted_shards, dim=0)
-                default_weight_loader(param, concat_weight)
+                weight_loader = getattr(param, "weight_loader", None)
+                if weight_loader:
+                    weight_loader(param, concat_weight)
+                else:
+                    param.data.copy_(concat_weight)
+                loaded.add(mapped_name)
 
         # Mark remaining MIMO params as handled (randomly initialized if not
         # in checkpoint) so vLLM doesn't error on uninitialized weights.

@@ -1022,7 +1022,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         end,
                     )
                 payload: dict[str, object] = {"hidden": req_hidden_states}
-
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
@@ -1041,6 +1040,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 return {k: _unwrap_lists(sv) for k, sv in v.items()}
                             return v
 
+<<<<<<< HEAD
                         for mm_key in combined_multimodal_outputs.keys():
                             mm_payload[mm_key] = _unwrap_lists(combined_multimodal_outputs[mm_key][rid])
 
