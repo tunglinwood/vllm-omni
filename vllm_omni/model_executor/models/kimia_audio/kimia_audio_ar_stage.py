@@ -658,11 +658,6 @@ class KimiAudioFusedForConditionalGeneration(
                     whisper_feature = whisper_feature.to(device=device, dtype=torch.bfloat16)
                     audio_input = {"whisper_input_features": whisper_feature}
                     self._input_whisper_emb = self._process_audio_input(audio_input)
-                    logger.debug(
-                        "Mel spectrogram routed through upstream audio_tower: %s -> %s",
-                        list(whisper_feature.shape),
-                        list(self._input_whisper_emb.shape),
-                    )
                 else:
                     # Pre-extracted features (5120-dim or 3584-dim) — store directly
                     self._input_whisper_emb = whisper_feature
@@ -915,9 +910,62 @@ class KimiAudioFusedForConditionalGeneration(
                     is_continuous_mask = torch.zeros(seq_len, dtype=torch.bool, device=input_ids.device)
                     is_continuous_mask[mb_pos[0].item() + 1 : me_pos[0].item()] = True
                 else:
-                    # No media_begin/media_end tokens found — no audio to track
-                    self._prefill_audio_offset = 0
-                    return audio_emb if text_emb is None else audio_emb + text_emb
+                    # Media tokens not in input_ids — derive from Whisper features.
+                    # When audio_len > seq_len, expand the embedding to include
+                    # audio positions after text tokens.
+                    whisper_raw = self._input_whisper_emb
+                    if whisper_raw.dim() == 4:
+                        whisper_raw = whisper_raw.reshape(1, -1, whisper_raw.shape[-1])
+                    if whisper_raw.dim() == 3:
+                        audio_len = whisper_raw.shape[1]
+                    elif whisper_raw.dim() == 2:
+                        audio_len = whisper_raw.shape[0]
+                    else:
+                        audio_len = 0
+
+                    if audio_len > 0:
+                        text_len = seq_len  # Current seq_len is text-only
+                        combined_len = text_len + audio_len
+                        hidden_dim = audio_emb.shape[-1]
+
+                        # Build combined embeddings: text first, then audio
+                        combined = torch.zeros(combined_len, hidden_dim, device=audio_emb.device, dtype=audio_emb.dtype)
+                        combined[:text_len] = audio_emb  # text embeddings
+
+                        # Apply multi_modal_projector if needed
+                        if whisper_raw.shape[-1] == 5120:
+                            whisper_3584 = (
+                                self.multi_modal_projector(
+                                    whisper_raw.to(device=audio_emb.device, dtype=torch.bfloat16)
+                                )
+                                .squeeze(0)
+                                .to(audio_emb.device, dtype=audio_emb.dtype)
+                            )
+                        else:
+                            whisper_3584 = whisper_raw.squeeze(0).to(audio_emb.device, dtype=audio_emb.dtype)
+
+                        # Scale whisper features to match backbone statistics
+                        # (sqrt(2) scaling, same as reference model's encoder_input)
+                        combined[text_len:text_len + audio_len] = whisper_3584 * (2.0**0.5)
+
+                        # Build is_continuous_mask: False for text, True for audio
+                        is_continuous_mask = torch.zeros(combined_len, dtype=torch.bool, device=audio_emb.device)
+                        is_continuous_mask[text_len:text_len + audio_len] = True
+
+                        audio_emb = combined
+                        seq_len = combined_len
+
+                        # Store for position ID override
+                        self._prefill_audio_offset = audio_len
+
+                        return audio_emb if text_emb is None else audio_emb + text_emb
+                    else:
+                        logger.warning(
+                            "_combine: Cannot derive audio_len from whisper shape=%s",
+                            list(whisper_raw.shape),
+                        )
+                        self._prefill_audio_offset = 0
+                        return audio_emb if text_emb is None else audio_emb + text_emb
             else:
                 # No whisper features — no audio prefill
                 self._prefill_audio_offset = 0
@@ -1062,16 +1110,29 @@ class KimiAudioFusedForConditionalGeneration(
 
             # Override positions for combined sequence during prefill
             if is_prefill and getattr(self, "_prefill_audio_offset", 0) > 0:
-                audio_offset = self._prefill_audio_offset
-                _text_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
-                full_seq_len = max(audio_offset, _text_len)
+                # Use actual hidden_states sequence length for positions
+                if hidden_states.dim() == 3:
+                    full_seq_len = hidden_states.shape[1]
+                elif hidden_states.dim() == 2:
+                    full_seq_len = hidden_states.shape[0]
+                else:
+                    audio_offset = self._prefill_audio_offset
+                    _text_len = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+                    full_seq_len = max(audio_offset, _text_len)
                 positions = torch.arange(full_seq_len, device=positions.device, dtype=positions.dtype)
                 if hidden_states.dim() == 3 and positions.dim() == 1:
                     positions = positions.unsqueeze(0)
 
             if is_prefill:
+                # Use actual hidden_states length when expanded (S2S with Whisper)
+                if hidden_states.dim() == 3:
+                    self._prefill_seq_len = hidden_states.shape[1]
+                elif hidden_states.dim() == 2:
+                    self._prefill_seq_len = hidden_states.shape[0]
+                else:
+                    _text_len_for_seq = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
+                    self._prefill_seq_len = max(getattr(self, "_prefill_audio_offset", 0), _text_len_for_seq)
                 _text_len_for_seq = input_ids.shape[-1] if input_ids is not None else inputs_embeds.shape[1]
-                self._prefill_seq_len = max(getattr(self, "_prefill_audio_offset", 0), _text_len_for_seq)
                 self._prefill_text_len = _text_len_for_seq
             elif not is_prefill and getattr(self, "_prefill_seq_len", 0) > 0:
                 pos_delta = self._prefill_seq_len - self._prefill_text_len
@@ -1217,11 +1278,12 @@ class KimiAudioFusedForConditionalGeneration(
                 _log_mimo = os.environ.get("DIAG_MIMO", "0") == "1"
                 if _log_mimo and layer_idx == 0:
                     _mimo_in_std = mimo_hidden_states.float().std().item()
-                    _mimo_in_mean = mimo_hidden_states.float().mean().item()
                     _mimo_shape = list(mimo_hidden_states.shape)
                     _mimo_nonzero = (mimo_hidden_states.abs() > 1e-6).sum().item()
-                    _mimo_total = mimo_hidden_states.numel()
-                    logger.info(f"[MIMO DIAG] prefill={is_prefill} layer={layer_idx} shape={_mimo_shape} input_std={_mimo_in_std:.4f} nonzero={_mimo_nonzero}/{_mimo_total}")
+                    logger.info(
+                        "[MIMO DIAG] prefill=%s layer=%d shape=%s input_std=%.4f nonzero=%d",
+                        is_prefill, layer_idx, _mimo_shape, _mimo_in_std, _mimo_nonzero,
+                    )
 
                 # Granular capture: hook self_attn and mlp outputs
                 if _capture_mimo:

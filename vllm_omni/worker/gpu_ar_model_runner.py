@@ -705,6 +705,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: Any,
+        multimodal_outputs: Any = None,
     ):
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -721,9 +722,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
+                # [Kimia-Audio] Extract audio_logits from multimodal_outputs
+                # and pass to the model's custom sample() for audio code generation.
+                audio_logits = None
+                if isinstance(multimodal_outputs, dict):
+                    audio_logits = multimodal_outputs.get("audio_logits")
+                # Fallback: try model's _audio_logits attribute
+                if audio_logits is None:
+                    audio_logits = getattr(self.model, "_audio_logits", None)
                 sampler_output = model_sample(
                     logits,
                     self._sampling_metadata_for_model_sampler(sampling_metadata),
+                    audio_logits=audio_logits,
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -812,7 +822,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(logits, spec_decode_metadata, multimodal_outputs)
+
+        # [Kimia-Audio] Inject sampled audio codes into multimodal_outputs
+        # so they propagate through pooler_output to the stage output.
+        # The model's sample() stores _audio_codes but multimodal_outputs
+        # from forward() has audio_codes=torch.empty(0).
+        audio_codes = getattr(self.model, "_audio_codes", None) if hasattr(self.model, "_audio_codes") else None
+        if audio_codes is not None and audio_codes.numel() > 0:
+            if isinstance(multimodal_outputs, dict):
+                multimodal_outputs["audio_codes"] = audio_codes.clone()
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 

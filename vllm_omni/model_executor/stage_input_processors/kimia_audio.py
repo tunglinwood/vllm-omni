@@ -8,6 +8,10 @@ packages them as input for Stage 1 (code2wav detokenizer).
 Kimi-Audio produces single-token audio codes per step (not multi-channel
 RVQ like MiMoAudio), so no column-major flattening is needed at this level.
 The code2wav detokenizer handles the ODE-based waveform generation internally.
+
+Audio codes are injected into multimodal_outputs via the model runner's
+sample_tokens() method (from model._audio_codes). They arrive as a tensor
+in multimodal_output["audio_codes"].
 """
 
 from typing import Any
@@ -16,94 +20,73 @@ import torch
 from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
-from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
-    _validate_stage_inputs,
-)
 
 logger = init_logger(__name__)
 
+TOKEN_OFFSET = 152064  # kimia_token_offset from config
+
 
 def fused2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: Any = None,
     requires_multimodal_data: bool = False,
+    streaming_context: Any = None,
 ) -> list[Any]:
     """Non-async: collect fused stage outputs, then pass audio codes to code2wav.
 
     Args:
-        stage_list: List of stage outputs from upstream stages.
-        engine_input_source: Indices of upstream stages to consume.
+        source_outputs: List of output objects from upstream stages.
         prompt: Original prompt (unused currently).
         requires_multimodal_data: Whether multimodal data is required (unused).
+        streaming_context: Streaming context (unused).
 
     Returns:
         List of OmniTokensPrompt containing audio codes for the code2wav stage.
     """
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     code2wav_inputs: list[OmniTokensPrompt] = []
 
-    for talker_output in talker_outputs:
-        if not talker_output.finished:
-            # Non-async decode runs once after talker has accumulated
-            # the final code sequence.
+    for source_output in source_outputs:
+        if not source_output.finished:
             continue
 
-        output = talker_output.outputs[0]
-        audio_codes = output.multimodal_output.get("audio_codes")
+        output = source_output.outputs[0]
 
-        logger.info(
-            "DIAG fused2code2wav: talker_output.finished=%s, talker_output.outputs count=%d, "
-            "output type=%s, output.multimodal_output=%s",
-            talker_output.finished,
-            len(talker_output.outputs),
-            type(output).__name__,
-            output.multimodal_output,
-        )
+        # First try multimodal_output["audio_codes"] (injected by model runner)
+        mm_output = output.multimodal_output if hasattr(output, 'multimodal_output') else None
+        audio_codes_tensor = None
 
-        # Dump full structure for debugging
-        if output.multimodal_output is not None:
-            mm = output.multimodal_output
-            if isinstance(mm, dict):
-                logger.info("DIAG fused2code2wav: multimodal_output keys=%s", list(mm.keys()))
-                for k, v in mm.items():
-                    if isinstance(v, torch.Tensor):
-                        logger.info("DIAG fused2code2wav:   %s: tensor shape=%s dtype=%s", k, list(v.shape), v.dtype)
-                    else:
-                        logger.info("DIAG fused2code2wav:   %s: %s", k, type(v).__name__)
+        if isinstance(mm_output, dict):
+            audio_codes_tensor = mm_output.get("audio_codes")
+        elif mm_output is not None:
+            if hasattr(mm_output, "get"):
+                audio_codes_tensor = mm_output.get("audio_codes")
+
+        if audio_codes_tensor is None or (isinstance(audio_codes_tensor, torch.Tensor) and audio_codes_tensor.numel() == 0):
+            # Fallback: try extracting from token_ids (tokens >= TOKEN_OFFSET)
+            token_ids = list(output.token_ids) if output.token_ids else []
+            audio_codes_from_tokens = [tid - TOKEN_OFFSET for tid in token_ids if tid >= TOKEN_OFFSET]
+
+            if audio_codes_from_tokens:
+                codec_codes = audio_codes_from_tokens
             else:
-                logger.info("DIAG fused2code2wav: multimodal_output type=%s attrs=%s", type(mm).__name__, dir(mm))
-
-        if audio_codes is None or (isinstance(audio_codes, torch.Tensor) and audio_codes.numel() == 0):
-            logger.warning("No audio_codes found in fused stage output, skipping.")
-            continue
-
-        # Convert audio codes to flat list of token IDs for code2wav stage
-        # audio_codes may be a bare tensor (current) or list-wrapped (legacy):
-        #   {"audio_codes": tensor(...)}  or  {"audio_codes": [tensor(...)]}
-        if isinstance(audio_codes, list):
-            # Unwrap: list-wrapped payload from fused stage
-            if len(audio_codes) > 0 and isinstance(audio_codes[0], torch.Tensor):
-                audio_codes = audio_codes[0]
-                codec_codes = audio_codes.to(torch.long).reshape(-1).cpu().tolist()
-            else:
-                codec_codes = audio_codes
-        elif isinstance(audio_codes, torch.Tensor):
-            audio_codes = audio_codes.to(torch.long)
-            # Flatten to 1D: code2wav expects flat token IDs
-            codec_codes = audio_codes.reshape(-1).cpu().tolist()
+                logger.warning(
+                    "No audio codes found. multimodal_output keys=%s, "
+                    "max_token=%d, token_ids=%s",
+                    list(mm_output.keys()) if isinstance(mm_output, dict) else "N/A",
+                    max(token_ids) if token_ids else 0,
+                    token_ids[:20] if token_ids else [],
+                )
+                continue
+        elif isinstance(audio_codes_tensor, torch.Tensor):
+            audio_codes_tensor = audio_codes_tensor.to(torch.long)
+            codec_codes = audio_codes_tensor.reshape(-1).cpu().tolist()
         else:
-            logger.warning(
-                "Unexpected audio_codes type: %s, skipping.",
-                type(audio_codes),
-            )
-            continue
+            codec_codes = list(audio_codes_tensor)
 
         if not codec_codes:
             continue
 
         # Guard against oversized code sequences that would crash code2wav.
-        # This can happen if audio codes accumulate incorrectly across steps.
         MAX_AUDIO_CODES = 8192  # max_model_len of code2wav stage
         if len(codec_codes) > MAX_AUDIO_CODES:
             logger.warning(
