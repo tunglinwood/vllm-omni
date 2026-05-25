@@ -657,7 +657,22 @@ class KimiAudioFusedForConditionalGeneration(
                     device = self.audio_tower.conv1.weight.device
                     whisper_feature = whisper_feature.to(device=device, dtype=torch.bfloat16)
                     audio_input = {"whisper_input_features": whisper_feature}
+
+                    # Diagnostic: print Mel spectrogram stats before audio_tower
+                    if os.environ.get("KIMIA_DIAG_AUDIO", "0") == "1":
+                        mel = whisper_feature.float()
+                        print(f"    [DIAG] Mel input: shape={list(mel.shape)}, "
+                              f"mean={mel.mean():.6f}, std={mel.std():.6f}, "
+                              f"min={mel.min():.6f}, max={mel.max():.6f}")
+
                     self._input_whisper_emb = self._process_audio_input(audio_input)
+
+                    # Diagnostic: print 3584-dim output stats after full pipeline
+                    if os.environ.get("KIMIA_DIAG_AUDIO", "0") == "1":
+                        emb = self._input_whisper_emb.float()
+                        print(f"    [DIAG] After audio_tower+projector: shape={list(emb.shape)}, "
+                              f"mean={emb.mean():.6f}, std={emb.std():.6f}, "
+                              f"min={emb.min():.6f}, max={emb.max():.6f}")
                 else:
                     # Pre-extracted features (5120-dim or 3584-dim) — store directly
                     self._input_whisper_emb = whisper_feature
@@ -694,7 +709,22 @@ class KimiAudioFusedForConditionalGeneration(
                             whisper_feature = whisper_feature.to(device=device, dtype=torch.bfloat16)
                             audio_input = {"whisper_input_features": whisper_feature}
                             audio_inputs = self._parse_and_validate_audio_input(**audio_input)
+
+                            # Diagnostic: print Mel spectrogram stats
+                            if os.environ.get("KIMIA_DIAG_AUDIO", "0") == "1":
+                                mel = whisper_feature.float()
+                                print(f"    [DIAG] Mel input (buffer): shape={list(mel.shape)}, "
+                                      f"mean={mel.mean():.6f}, std={mel.std():.6f}, "
+                                      f"min={mel.min():.6f}, max={mel.max():.6f}")
+
                             self._input_whisper_emb = self._process_audio_input(audio_inputs)
+
+                            # Diagnostic: print 3584-dim output stats
+                            if os.environ.get("KIMIA_DIAG_AUDIO", "0") == "1":
+                                emb = self._input_whisper_emb.float()
+                                print(f"    [DIAG] After audio_tower+projector (buffer): shape={list(emb.shape)}, "
+                                      f"mean={emb.mean():.6f}, std={emb.std():.6f}, "
+                                      f"min={emb.min():.6f}, max={emb.max():.6f}")
                         else:
                             self._input_whisper_emb = whisper_feature
                         whisper_raw = req_info.get("whisper_raw")
@@ -723,6 +753,75 @@ class KimiAudioFusedForConditionalGeneration(
                         except Exception as e:
                             logger.warning("Failed to deserialize Whisper features: %s", e)
                             return
+
+    def _process_audio_input(
+        self, audio_input: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Process Mel spectrogram through Whisper encoder -> 4x downsample -> projector.
+
+        Overrides upstream to add audio-length truncation, matching the reference
+        Kimi-Audio Whisper encoder behavior. Without truncation, Whisper produces
+        1500 frames (30s padded), yielding 375 output frames vs the expected ~47
+        for a 3.7s audio.
+
+        Supports optional ``num_samples`` key in audio_input to derive the
+        truncation boundary: token_len = (num_samples - 1) // 1280 + 1,
+        max_encoder_frames = token_len * 4.
+        """
+        input_features = audio_input["whisper_input_features"]
+        num_samples = audio_input.get("num_samples")
+
+        # KimiAudioWhisperEncoder expects list of tensors
+        if input_features.dim() == 3:
+            input_features = input_features.unbind(dim=0)
+
+        # Run through Whisper encoder
+        audio_features = self.audio_tower(input_features)
+
+        # Truncate encoder output to actual audio length before 4x downsample,
+        # matching reference Kimi-Audio Whisper encoder behavior (whisper_Lv3).
+        # HF WhisperFeatureExtractor pads audio to 30s (480000 samples),
+        # producing 1500 encoder frames. Without truncation, the model attends
+        # to padding/silence frames, degrading generation quality.
+        if num_samples is not None:
+            B, seq_len, D = audio_features.shape
+            token_len = (num_samples - 1) // (160 * 8) + 1
+            max_encoder_frames = token_len * 4
+            if max_encoder_frames < seq_len:
+                audio_features = audio_features[:, :max_encoder_frames, :]
+        else:
+            # Fallback: detect audio boundary from encoder output energy.
+            # Whisper encoder output for silence/padding frames has near-zero
+            # energy. Find the last frame with significant energy.
+            B, seq_len, D = audio_features.shape
+            frame_energy = audio_features.norm(dim=-1)  # [B, T]
+            # Threshold: 5% of the max frame energy (robust to quiet audio)
+            max_energy = frame_energy.max(dim=-1, keepdim=True).values  # [B, 1]
+            threshold = max_energy * 0.05
+            # Find last frame above threshold for each batch
+            above = (frame_energy > threshold).float()  # [B, T]
+            # Use arghmax-like: find the last True position
+            indices = torch.arange(seq_len, device=audio_features.device, dtype=audio_features.dtype)
+            last_above = (above * indices).max(dim=-1).values.long()  # [B]
+            # Add small safety margin (4 frames = ~80ms)
+            max_encoder_frames = int(last_above[0].item()) + 4
+            # Round up to nearest multiple of 4 for 4x downsample
+            max_encoder_frames = ((max_encoder_frames + 3) // 4) * 4
+            if max_encoder_frames < seq_len and max_encoder_frames > 0:
+                audio_features = audio_features[:, :max_encoder_frames, :]
+
+        # Reshape for 4x downsampling (Whisper outputs at 50Hz, need 12.5Hz)
+        B, T, D = audio_features.shape
+        if T % 4 != 0:
+            pad_len = 4 - (T % 4)
+            audio_features = torch.nn.functional.pad(audio_features, (0, 0, 0, pad_len))
+            T = audio_features.shape[1]
+
+        audio_features = audio_features.reshape(B, T // 4, D * 4)
+
+        # Project to LLM dimension
+        audio_embeds = self.multi_modal_projector(audio_features)
+        return audio_embeds
 
     def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Apply token embeddings with S2S dual-stream Whisper injection."""
@@ -925,12 +1024,36 @@ class KimiAudioFusedForConditionalGeneration(
 
                     if audio_len > 0:
                         text_len = seq_len  # Current seq_len is text-only
-                        combined_len = text_len + audio_len
-                        hidden_dim = audio_emb.shape[-1]
 
-                        # Build combined embeddings: text first, then audio
-                        combined = torch.zeros(combined_len, hidden_dim, device=audio_emb.device, dtype=audio_emb.dtype)
-                        combined[:text_len] = audio_emb  # text embeddings
+                        # Build proper audio_input_ids with scaffolding tokens
+                        # matching the reference model's format:
+                        # [text_tokens, media_begin, audio_blanks, media_end]
+                        media_begin = int(self.config.kimia_media_begin)
+                        media_end = int(self.config.kimia_media_end)
+                        audio_blank_index = 18  # Reference blank token ID
+
+                        audio_blanks = torch.full(
+                            (audio_len,),
+                            audio_blank_index + token_offset,
+                            device=input_ids.device,
+                            dtype=input_ids.dtype,
+                        )
+                        full_audio_input_ids = torch.cat([
+                            input_ids,
+                            torch.tensor([media_begin], device=input_ids.device, dtype=input_ids.dtype),
+                            audio_blanks,
+                            torch.tensor([media_end], device=input_ids.device, dtype=input_ids.dtype),
+                        ])
+
+                        # Embed the full sequence — this gives correct token
+                        # embeddings for all positions including scaffolding.
+                        audio_emb = embed_tokens_fn(full_audio_input_ids)
+                        combined_len = len(full_audio_input_ids)
+                        seq_len = combined_len
+
+                        # Build is_continuous_mask: True only at audio_blank positions
+                        is_continuous_mask = torch.zeros(seq_len, dtype=torch.bool, device=audio_emb.device)
+                        is_continuous_mask[text_len + 1 : text_len + 1 + audio_len] = True
 
                         # Apply multi_modal_projector if needed
                         if whisper_raw.shape[-1] == 5120:
@@ -944,16 +1067,13 @@ class KimiAudioFusedForConditionalGeneration(
                         else:
                             whisper_3584 = whisper_raw.squeeze(0).to(audio_emb.device, dtype=audio_emb.dtype)
 
-                        # Scale whisper features to match backbone statistics
-                        # (sqrt(2) scaling, same as reference model's encoder_input)
-                        combined[text_len:text_len + audio_len] = whisper_3584 * (2.0**0.5)
-
-                        # Build is_continuous_mask: False for text, True for audio
-                        is_continuous_mask = torch.zeros(combined_len, dtype=torch.bool, device=audio_emb.device)
-                        is_continuous_mask[text_len:text_len + audio_len] = True
-
-                        audio_emb = combined
-                        seq_len = combined_len
+                        # Inject Whisper: overlay onto audio_blank embeddings
+                        # using the same (audio_emb + whisper) * sqrt(2) scaling
+                        audio_mask_3d = is_continuous_mask.to(audio_emb.dtype).unsqueeze(-1)
+                        whisper_expanded = torch.zeros_like(audio_emb)
+                        whisper_expanded[text_len + 1 : text_len + 1 + audio_len] = whisper_3584
+                        encoder_input = (audio_emb + whisper_expanded) * (2.0**0.5)
+                        audio_emb = audio_emb * (~audio_mask_3d.to(torch.bool)) + encoder_input * audio_mask_3d.to(torch.bool)
 
                         # Store for position ID override
                         self._prefill_audio_offset = audio_len
