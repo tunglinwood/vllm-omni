@@ -2044,6 +2044,74 @@ class KimiaAudioFusedForConditionalGeneration(
 
         return all_audio_codes, all_text_codes
 
+    def _process_audio_input(
+        self, audio_input: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Process Mel spectrogram through Whisper encoder -> 4x downsample -> projector.
+
+        Overrides upstream vLLM to add audio-length truncation, matching the
+        reference Kimi-Audio Whisper encoder behavior (whisper_Lv3). Without
+        truncation, Whisper produces 1500 frames (30s padded), yielding 375
+        output frames after 4x downsample vs ~47 for a 3.7s audio.
+
+        Supports optional ``num_samples`` key in audio_input to derive the
+        truncation boundary: token_len = (num_samples - 1) // 1280 + 1,
+        max_encoder_frames = token_len * 4.
+        """
+        input_features = audio_input["whisper_input_features"]
+        num_samples = audio_input.get("num_samples")
+
+        # KimiAudioWhisperEncoder expects list of tensors
+        if input_features.dim() == 3:
+            input_features = input_features.unbind(dim=0)
+
+        # Run through Whisper encoder
+        audio_features = self.audio_tower(input_features)
+
+        # Truncate encoder output to actual audio length before 4x downsample,
+        # matching reference Kimi-Audio Whisper encoder behavior (whisper_Lv3).
+        # HF WhisperFeatureExtractor pads audio to 30s (480000 samples),
+        # producing 1500 encoder frames. Without truncation, the model attends
+        # to padding/silence frames, degrading generation quality.
+        if num_samples is not None:
+            B, seq_len, D = audio_features.shape
+            token_len = (num_samples - 1) // (160 * 8) + 1
+            max_encoder_frames = token_len * 4
+            if max_encoder_frames < seq_len:
+                audio_features = audio_features[:, :max_encoder_frames, :]
+        else:
+            # Fallback: detect audio boundary from encoder output energy.
+            # Whisper encoder output for silence/padding frames has near-zero
+            # energy. Find the last frame with significant energy.
+            B, seq_len, D = audio_features.shape
+            frame_energy = audio_features.norm(dim=-1)  # [B, T]
+            # Threshold: 5% of the max frame energy (robust to quiet audio)
+            max_energy = frame_energy.max(dim=-1, keepdim=True).values  # [B, 1]
+            threshold = max_energy * 0.05
+            # Find last frame above threshold for each batch
+            above = (frame_energy > threshold).float()  # [B, T]
+            indices = torch.arange(seq_len, device=audio_features.device, dtype=audio_features.dtype)
+            last_above = (above * indices).max(dim=-1).values.long()  # [B]
+            # Add small safety margin (4 frames = ~80ms)
+            max_encoder_frames = int(last_above[0].item()) + 4
+            # Round up to nearest multiple of 4 for 4x downsample
+            max_encoder_frames = ((max_encoder_frames + 3) // 4) * 4
+            if max_encoder_frames < seq_len and max_encoder_frames > 0:
+                audio_features = audio_features[:, :max_encoder_frames, :]
+
+        # Reshape for 4x downsampling (Whisper outputs at 50Hz, need 12.5Hz)
+        B, T, D = audio_features.shape
+        if T % 4 != 0:
+            pad_len = 4 - (T % 4)
+            audio_features = torch.nn.functional.pad(audio_features, (0, 0, 0, pad_len))
+            T = audio_features.shape[1]
+
+        audio_features = audio_features.reshape(B, T // 4, D * 4)
+
+        # Project to LLM dimension
+        audio_embeds = self.multi_modal_projector(audio_features)
+        return audio_embeds
+
     def embed_input_ids(self, input_ids: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Apply token embeddings to input_ids for vLLM runner compatibility.
 
