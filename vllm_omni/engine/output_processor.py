@@ -93,14 +93,7 @@ class OmniRequestState(RequestState):
                         self.mm_accumulated[k] = v
                     else:
                         existing = self.mm_accumulated[k]
-                        # audio_codes is already cumulative (model._audio_codes
-                        # contains ALL codes generated so far). Replacing on
-                        # each step avoids concatenating duplicate accumulations
-                        # (e.g., 1+2+3+...+19=190 instead of 19).
-                        if k == "audio_codes":
-                            self.mm_accumulated[k] = v
-                        elif isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
-                            # Use list accumulation to avoid O(n²) repeated concatenation
+                        if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
                             self.mm_accumulated[k] = [existing, v]
                         elif isinstance(v, torch.Tensor) and isinstance(existing, list):
                             existing.append(v)
@@ -296,6 +289,7 @@ class OmniRequestState(RequestState):
         if self.output_kind == RequestOutputKind.DELTA:
             for modality_key in DRAINABLE_MODALITIES:
                 self.mm_accumulated.pop(modality_key, None)
+
         return base_output
 
 
@@ -412,22 +406,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
-            # Capture multimodal output even when detokenizer is None
-            # (e.g., generation stages like code2wav that produce waveforms)
-            if eco.pooling_output is not None:
+            if eco.pooling_output is not None and req_state.detokenizer is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
-                logger.info(
-                    "[DIAG OUTPUT PROCESSOR] Capturing pooling_output for req %s, mm_type=%s, eco.pooling_output type=%s",
-                    eco.request_id, mm_type, type(eco.pooling_output).__name__,
-                )
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.
                 eco.pooling_output = None
-            else:
-                logger.info(
-                    "[DIAG OUTPUT PROCESSOR] eco.pooling_output is None for req %s",
-                    eco.request_id,
-                )
 
         return super().process_outputs(
             engine_core_outputs,

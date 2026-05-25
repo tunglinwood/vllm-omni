@@ -71,7 +71,7 @@ def _register_omni_hf_configs() -> None:
             _CONFIG_REGISTRY[model_type] = config_cls
 
 
-def register_omni_models_to_vllm() -> None:
+def register_omni_models_to_vllm():
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_omni.model_executor.models.registry import _OMNI_MODELS
@@ -207,7 +207,7 @@ class OmniEngineArgs(EngineArgs):
             }
         return {k: getattr(self, k) for k in explicit}
 
-    def _ensure_omni_models_registered(self) -> bool:
+    def _ensure_omni_models_registered(self):
         if hasattr(self, "_omni_models_registered"):
             return True
         register_omni_models_to_vllm()
@@ -231,7 +231,7 @@ class OmniEngineArgs(EngineArgs):
         # Create a temp dir with a patched config.json
         temp_dir = tempfile.mkdtemp(prefix="omni_hf_config_")
         config_dict["model_type"] = model_type
-        config_dict["architectures"] = [self.model_arch]
+        config_dict.setdefault("architectures", [self.model_arch])
         with open(os.path.join(temp_dir, "config.json"), "w") as f:
             json.dump(config_dict, f)
         self.hf_config_path = temp_dir
@@ -261,19 +261,7 @@ class OmniEngineArgs(EngineArgs):
             if self.hf_overrides is None:
                 self.hf_overrides = {}
             if isinstance(self.hf_overrides, dict):
-                # Force override architectures when model_arch is explicitly
-                # specified in the stage config, even if config.json already
-                # has an architectures field (e.g., Kimi-Audio's
-                # MoonshotKimiaForCausalLM needs to become
-                # KimiAudioFusedForConditionalGeneration).
-                existing_arch = self.hf_overrides.get("architectures")
-                if existing_arch and existing_arch != [self.model_arch]:
-                    logger.warning(
-                        "Overriding architectures from %s to %s (model_arch set in stage config)",
-                        existing_arch,
-                        self.model_arch,
-                    )
-                self.hf_overrides["architectures"] = [self.model_arch]
+                self.hf_overrides.setdefault("architectures", [self.model_arch])
                 if "model_type" not in self.hf_overrides:
                     model_type = _ARCH_TO_MODEL_TYPE.get(self.model_arch)
                     if model_type is not None:

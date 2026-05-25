@@ -10,7 +10,6 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
-import tempfile
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING, Any
 
@@ -80,15 +79,6 @@ class StageEngineCoreProc(EngineCoreProc):
         """
         signal_callback: SignalCallback | None = None
         maybe_register_config_serialize_by_value()
-
-        # Register vLLM-Omni models in the subprocess so the V1 engine
-        # can resolve architectures like KimiAudioFusedForConditionalGeneration
-        # instead of falling back to TransformersForCausalLM.
-        try:
-            from vllm_omni.engine.arg_utils import register_omni_models_to_vllm
-            register_omni_models_to_vllm()
-        except Exception:
-            pass  # Best-effort; models may already be registered
 
         engine_core: StageEngineCoreProc | None = None
         coord_client: OmniCoordClientForStage | None = None
@@ -180,49 +170,6 @@ class StageEngineCoreProc(EngineCoreProc):
                 engine_core.shutdown()
 
 
-def _run_stage_core_with_stderr_capture(
-    stderr_path: str,
-    vllm_config: Any,
-    local_client: bool,
-    handshake_address: str,
-    executor_class: Any,
-    log_stats: bool,
-    dp_rank: int,
-    local_dp_rank: int,
-) -> None:
-    """Module-level wrapper that redirects stderr to a file then calls run_stage_core.
-
-    Must be at module level so it can be pickled for spawn-mode multiprocessing.
-    """
-    import sys
-
-    fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-    old_stderr_fd = os.dup(2)
-    os.dup2(fd, 2)
-    os.close(fd)
-    try:
-        StageEngineCoreProc.run_stage_core(
-            vllm_config=vllm_config,
-            local_client=local_client,
-            handshake_address=handshake_address,
-            executor_class=executor_class,
-            log_stats=log_stats,
-            dp_rank=dp_rank,
-            local_dp_rank=local_dp_rank,
-        )
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except BaseException:
-        # Ensure traceback goes to stderr (now the temp file).
-        import traceback
-
-        traceback.print_exc(file=sys.stderr)
-        raise
-    finally:
-        os.dup2(old_stderr_fd, 2)
-        os.close(old_stderr_fd)
-
-
 def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
@@ -238,22 +185,11 @@ def spawn_stage_core(
     addresses = get_engine_zmq_addresses(vllm_config)
     handshake_address = get_open_zmq_ipc_path()
 
-    # Capture stderr to a temp file so we can read it if the process dies.
-    stderr_file = tempfile.NamedTemporaryFile(
-        prefix="vllm_omni_stage_stderr_",
-        suffix=".log",
-        delete=False,
-        mode="w",
-    )
-    stderr_path = stderr_file.name
-    stderr_file.close()
-
     ctx = get_mp_context()
     proc = ctx.Process(
-        target=_run_stage_core_with_stderr_capture,
+        target=StageEngineCoreProc.run_stage_core,
         name="StageEngineCoreProc",
         kwargs={
-            "stderr_path": stderr_path,
             "vllm_config": vllm_config,
             "local_client": True,
             "handshake_address": handshake_address,
@@ -264,18 +200,7 @@ def spawn_stage_core(
         },
     )
     proc.start()
-    proc._stderr_path = stderr_path  # type: ignore[attr-defined]
     return addresses, proc, handshake_address
-
-
-def _cleanup_stderr(proc: BaseProcess) -> None:
-    """Remove the temp stderr file attached to a subprocess."""
-    stderr_path = getattr(proc, "_stderr_path", None)
-    if stderr_path and os.path.exists(stderr_path):
-        try:
-            os.unlink(stderr_path)
-        except OSError:
-            pass
 
 
 def complete_stage_handshake(
@@ -294,8 +219,6 @@ def complete_stage_handshake(
     except Exception:
         shutdown([proc])
         raise
-    # Success — clean up the temp stderr file.
-    _cleanup_stderr(proc)
 
 
 def _perform_handshake(
@@ -350,23 +273,4 @@ def _recv(
             identity, raw = handshake_socket.recv_multipart()
             return identity, msgspec.msgpack.decode(raw)
         if proc.exitcode is not None:
-            stderr_path = getattr(proc, "_stderr_path", None)
-            stderr_info = ""
-            if stderr_path and os.path.exists(stderr_path):
-                try:
-                    with open(stderr_path) as f:
-                        stderr_content = f.read()
-                    if stderr_content:
-                        # Show last 80 lines to avoid overwhelming output
-                        lines = stderr_content.splitlines()
-                        shown = lines[-80:]
-                        stderr_info = (
-                            f"\n--- Subprocess stderr (last {len(shown)} lines) ---\n"
-                            + "\n".join(shown)
-                            + f"\n--- Full stderr: {stderr_path} ---"
-                        )
-                except Exception:
-                    stderr_info = f"\n--- Could not read stderr from {stderr_path} ---"
-            # Clean up the temp file — we've already read its content.
-            _cleanup_stderr(proc)
-            raise RuntimeError(f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode})" + stderr_info)
+            raise RuntimeError(f"StageEngineCoreProc died during {expected} (exit code {proc.exitcode})")

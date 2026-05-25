@@ -41,7 +41,6 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
-from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -68,32 +67,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,
             )
-
-    @torch.inference_mode()
-    def extract_multimodal_outputs(self, hidden_states):
-        """Override to handle OmniOutput deconstructed by CUDA graph replay.
-
-        During CUDA graph capture, vLLM's CUDAGraphWrapper stores the model
-        output and applies weak_ref_tensors. Since OmniOutput is a NamedTuple
-        (tuple subclass), weak_ref_tensors converts it to a plain tuple.
-        On graph replay, the plain tuple is returned instead of OmniOutput,
-        causing the parent class to misinterpret it as a list of hidden states.
-
-        This method detects the 4-element OmniOutput tuple pattern and recovers
-        the multimodal outputs correctly.
-        """
-        # Detect deconstructed OmniOutput: (text_hs, multimodal_dict, inter, next_tok)
-        if (
-            isinstance(hidden_states, tuple)
-            and len(hidden_states) == 4
-            and isinstance(hidden_states[1], dict)
-        ):
-            text_hidden_states = hidden_states[0]
-            multimodal_outputs = hidden_states[1]
-            return text_hidden_states, multimodal_outputs
-
-        # Fall back to parent class behavior
-        return super().extract_multimodal_outputs(hidden_states)
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -171,7 +144,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             deferred_state_corrections_fn = self._update_states(scheduler_output)
-            self._decode_and_store_request_payloads(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
                 return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
@@ -330,11 +302,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
-
-        # Disable CUDA graph for models that produce dynamic multimodal outputs
-        # (e.g., Kimia-Audio samples audio codes in Python forward()).
-        if getattr(self.model, "enforce_eager", False):
-            cudagraph_mode = CUDAGraphMode.NONE
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.

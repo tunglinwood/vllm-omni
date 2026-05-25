@@ -64,9 +64,9 @@ from vllm.entrypoints.openai.speech_to_text.serving import (
 )
 from vllm.entrypoints.openai.utils import validate_json_request
 from vllm.entrypoints.pooling.classify.serving import ServingClassification
-from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
-from vllm.entrypoints.pooling.pooling.serving import OpenAIServingPooling
-from vllm.entrypoints.pooling.score.serving import ServingScores
+from vllm.entrypoints.pooling.embed.serving import ServingEmbedding as OpenAIServingEmbedding
+from vllm.entrypoints.pooling.pooling.serving import ServingPooling
+from vllm.entrypoints.pooling.scoring.serving import ServingScores
 from vllm.entrypoints.serve.disagg.serving import ServingTokens
 
 # vLLM moved `base` from openai.basic.api_router to serve.instrumentator.basic.
@@ -202,17 +202,12 @@ def _remove_route_from_app(app, path: str, methods: set[str] | None = None):
 
     OMNI: used to override upstream /v1/chat/completions with omni behavior.
     """
-    from fastapi.routing import APIRoute
     routes_to_remove = []
     for route in app.routes:
-        if not isinstance(route, (Route, APIRoute)):
-            continue
-        route_path = getattr(route, "path", "")
-        if route_path != path:
-            continue
-        route_methods = getattr(route, "methods", set())
-        if methods is None or (route_methods & methods):
-            routes_to_remove.append(route)
+        if isinstance(route, Route) and route.path == path:
+            if methods is None or (hasattr(route, "methods") and route.methods & methods):
+                routes_to_remove.append(route)
+
     for route in routes_to_remove:
         app.routes.remove(route)
 
@@ -805,7 +800,7 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_pooling = (
-        OpenAIServingPooling(
+        ServingPooling(
             engine_client,
             state.openai_serving_models,
             supported_tasks=tuple(supported_tasks),

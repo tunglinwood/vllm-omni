@@ -270,22 +270,3 @@ vllm_omni/_version.py
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/
-
-# Investigation/debug scripts (root level only — proper tests in tests/)
-debug_*.py
-diagnose_*.py
-compare_*.py
-analyze_*.py
-evaluate_*.py
-extract_*.py
-generate_*.py
-run_*.py
-test_*.py
-
-# Local config/runtime artifacts
-*.cjs
-*.whl
-kimia-s2s-quality-match.plan_edit.md
-vllm_omni/model_executor/stage_configs/kimia_audio_*.yaml
-vllm_omni/model_executor/stage_configs/kimia_audio_gpu7.yaml
-vllm_omni/model_executor/stage_configs/kimi_audio.yaml
