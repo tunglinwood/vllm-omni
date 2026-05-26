@@ -428,6 +428,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped = True
 
             if stopped:
+                routed_experts = None
                 if (
                     model_runner_output.routed_experts_dict is not None
                     and req_id in model_runner_output.routed_experts_dict
