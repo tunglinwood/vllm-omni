@@ -1,7 +1,7 @@
 # Copyright 2025 vLLM-Omni Team
 """Stage 0: Kimi Audio LLM with bifurcation for dual output (text + audio)."""
 
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -176,15 +176,17 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             scale=1.0,
         )
 
-        # Dual streaming state (for feeding back both audio and text tokens)
-        self._pending_audio_token: Optional[torch.Tensor] = None
+        # Dual streaming state (per-slot management following HiggsAudioV2 pattern)
+        # These are lazily initialized in sample() to avoid issues with distributed setup
+        # self._audio_state: dict[int, dict[str, Any]] = {}
+        # self._slot_output_len: dict[int, int] = {}
+        # self._text_stream_finished: dict[int, bool] = {}
         self._pending_audio_logits: Optional[torch.Tensor] = None
-        self._generation_step: int = 0
 
-        # Special tokens (from reference implementation)
+        # Special tokens (from tokenizer)
         self._audio_delay: int = 6  # First 6 audio tokens are BLANK
-        self._blank_token_id: int = 18  # kimia_text_blank
-        self._text_eos_id: int = 19  # kimia_text_eos
+        self._blank_token_id: int = 151666  # <|im_kimia_text_blank|>
+        self._text_eos_id: int = 151667  # <|im_kimia_text_eos|>
         self._token_offset: int = 152064  # Audio tokens start here
 
     def forward(
@@ -332,13 +334,88 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         whisper_features = kwargs.get("whisper_input_features", None)
         feature_attention_mask = kwargs.get("feature_attention_mask", None)
 
+        # If whisper_features not provided, check for raw audio input
         if whisper_features is None:
+            raw_audio = kwargs.get("audio", None)
+            if raw_audio is not None:
+                # Preprocess raw audio to extract Whisper features
+                whisper_features = self._extract_whisper_features(raw_audio)
+                if whisper_features is not None:
+                    return {
+                        "whisper_input_features": whisper_features,
+                        "feature_attention_mask": None,
+                    }
             return None
 
         return {
             "whisper_input_features": whisper_features,
             "feature_attention_mask": feature_attention_mask,
         }
+
+    def _extract_whisper_features(self, raw_audio: Any) -> Optional[torch.Tensor]:
+        """Extract Whisper features from raw audio input.
+
+        Args:
+            raw_audio: Raw audio input (waveform tensor, numpy array, or file path)
+
+        Returns:
+            Whisper features tensor, or None if extraction fails
+        """
+        import numpy as np
+
+        # Convert raw audio to tensor
+        if isinstance(raw_audio, np.ndarray):
+            wav_tensor = torch.from_numpy(raw_audio).float()
+        elif isinstance(raw_audio, torch.Tensor):
+            wav_tensor = raw_audio.float()
+        elif isinstance(raw_audio, (str, bytes)):
+            # Load audio from file path
+            try:
+                import librosa
+                wav, sr = librosa.load(raw_audio, sr=16000)
+                wav_tensor = torch.from_numpy(wav).float()
+            except Exception as e:
+                print(f"ERROR: Failed to load audio from {raw_audio}: {e}", flush=True)
+                return None
+        else:
+            print(f"ERROR: Unsupported audio type: {type(raw_audio)}", flush=True)
+            return None
+
+        # Ensure tensor has batch dimension
+        if wav_tensor.dim() == 1:
+            wav_tensor = wav_tensor.unsqueeze(0)  # [T] -> [1, T]
+
+        # Move to device
+        wav_tensor = wav_tensor.to(next(self.audio_tower.parameters()).device)
+
+        # Extract Whisper features using the audio tower
+        try:
+            # Whisper encoder expects mel spectrogram or raw waveform
+            # Check if audio_tower has a method to extract features from waveform
+            if hasattr(self.audio_tower, 'tokenize_waveform'):
+                # Use the tokenize_waveform method if available
+                whisper_features = self.audio_tower.tokenize_waveform(wav_tensor)
+            else:
+                # Fallback: use the audio_tower directly (it should handle preprocessing)
+                whisper_features = self.audio_tower(wav_tensor)
+
+            # Reshape features if needed (reference implementation does this)
+            if whisper_features.dim() == 3:
+                # [B, T, D] -> [B, T//4, D*4]
+                whisper_features = whisper_features.reshape(
+                    whisper_features.shape[0],
+                    int(whisper_features.shape[1] // 4),
+                    whisper_features.shape[2] * 4,
+                )
+
+            print(f"Extracted Whisper features: shape={whisper_features.shape}", flush=True)
+            return whisper_features
+
+        except Exception as e:
+            print(f"ERROR: Failed to extract Whisper features: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return None
 
     def _process_audio_input(self, audio_input: dict) -> torch.Tensor:
         """Process audio input through Whisper encoder and VQAdaptor."""
@@ -448,36 +525,51 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                     # No mask provided, apply √2 scaling to all
                     text_emb = (text_emb + multimodal_embeddings) * (2 ** 0.5)
 
-        # 3. Embed audio tokens (from previous generation step)
-        # Use raw embedding weight to bypass VocabParallelEmbedding restrictions
-        if self._pending_audio_token is not None:
-            embed_weight = self.model.model.embed_tokens.weight
-            # Clamp token IDs to valid range [0, vocab_size-1]
-            audio_token_ids = self._pending_audio_token.clamp(0, embed_weight.shape[0] - 1)
-            audio_emb = torch.nn.functional.embedding(audio_token_ids, embed_weight)
-
-            # Squeeze extra dimensions if present
-            if audio_emb.dim() > 2:
-                audio_emb = audio_emb.squeeze(1)
-
-            # CRITICAL: Only add audio embedding to the LAST position (current generation step)
-            # text_emb shape: [num_tokens, hidden_dim]
-            # audio_emb shape: [num_reqs, hidden_dim] or [1, hidden_dim]
-            # We need to add audio_emb to the last token position only
-            if text_emb.shape[0] > 1 and audio_emb.shape[0] == 1:
-                # Single request: add audio_emb to the last position
-                inputs_embeds = text_emb.clone()
-                inputs_embeds[-1:] = inputs_embeds[-1:] + audio_emb
-            elif text_emb.shape[0] == audio_emb.shape[0]:
-                # Batched requests: add each audio_emb to corresponding last position
-                # This assumes all requests have the same sequence length
-                inputs_embeds = text_emb.clone()
-                inputs_embeds[-1:] = inputs_embeds[-1:] + audio_emb[-1:]
-            else:
-                # Fallback: shapes don't match, skip audio fusion
-                inputs_embeds = text_emb
-        else:
+        # 3. Embed audio tokens from per-slot state (dual token stream fusion)
+        # For each request, add the audio token embedding from the previous step
+        # This implements the dual token stream: audio_emb + text_emb
+        state = getattr(self, "_audio_state", None)
+        if not state:
+            # No audio state yet (first step or no audio generation)
             inputs_embeds = text_emb
+        else:
+            embed_weight = self.model.model.embed_tokens.weight
+            num_tokens = text_emb.shape[0]
+
+            # Determine batch row indices for each token position
+            # In vLLM, input_ids is typically [num_tokens] for prefill or [num_reqs, 1] for decode
+            if input_ids.dim() == 1:
+                # Prefill or single request: all tokens belong to request 0
+                batch_row_indices = [0] * num_tokens
+            else:
+                # Decode: each row is one request with 1 token
+                num_reqs = input_ids.shape[0]
+                batch_row_indices = list(range(num_reqs))
+
+            # Start with text embeddings
+            inputs_embeds = text_emb.clone()
+
+            # For each position, add the audio embedding from the corresponding request's state
+            for pos in range(num_tokens):
+                batch_i = batch_row_indices[pos] if pos < len(batch_row_indices) else 0
+                req_state = state.get(batch_i)
+                if req_state is None:
+                    continue
+
+                audio_out_ids = req_state.get("audio_out_ids")
+                if audio_out_ids is None or audio_out_ids.numel() == 0:
+                    continue
+
+                # Get the LAST audio token for this request (from previous generation step)
+                last_audio_token = audio_out_ids[:, -1:]  # [1, 1]
+                last_audio_token_id = last_audio_token.item()
+
+                # Clamp to valid range
+                last_audio_token_id = max(0, min(last_audio_token_id, embed_weight.shape[0] - 1))
+
+                # Embed the audio token and ADD to text embedding (dual stream fusion)
+                audio_emb = embed_weight[last_audio_token_id]  # [hidden_dim]
+                inputs_embeds[pos] = inputs_embeds[pos] + audio_emb.to(dtype=inputs_embeds.dtype)
 
         return inputs_embeds
 
@@ -519,9 +611,20 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> Optional[SamplerOutput]:
         """Custom sampler for dual token streaming.
 
-        Samples both text and audio tokens from their respective logits.
-        Audio tokens are stored for next step's embed_input_ids() fusion.
+        Implements the reference implementation's dual token stream logic:
+        1. Sample both text and audio tokens
+        2. Handle text stream termination (replace with BLANK after EOS)
+        3. Handle audio delay (first 6 tokens are BLANK)
+        4. Store audio tokens per-slot for next step's embedding
         """
+        # Initialize per-slot state dicts if needed (lazy initialization)
+        if not hasattr(self, "_audio_state"):
+            self._audio_state = {}
+        if not hasattr(self, "_slot_output_len"):
+            self._slot_output_len = {}
+        if not hasattr(self, "_text_stream_finished"):
+            self._text_stream_finished = {}
+
         # Initialize stock sampler if needed (following HiggsAudioV2 pattern)
         sampler = getattr(self, "_stock_sampler", None)
         if sampler is None:
@@ -529,44 +632,103 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             sampler = Sampler()
             self._stock_sampler = sampler
 
+        # Get batch row indices
+        num_reqs = logits.shape[0]
+        batch_row_indices = list(range(num_reqs))
+
+        # Detect slot reuse (new request in same slot)
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None)
+        for batch_i in batch_row_indices:
+            current_len = len(output_token_ids[batch_i]) if output_token_ids else 0
+            prior_len = self._slot_output_len.get(batch_i, -1)
+
+            # If length decreased, a new request has taken over this slot
+            is_new_request = (prior_len > current_len) or (prior_len == -1 and current_len == 0)
+            if is_new_request:
+                # Evict all stale state for this slot
+                self._audio_state.pop(batch_i, None)
+                self._text_stream_finished.pop(batch_i, None)
+            self._slot_output_len[batch_i] = current_len
+
         # 1. Sample text token from text logits
-        # Text logits are already filtered to [0, 152063] in compute_logits()
         text_sampler_output = sampler(logits=logits, sampling_metadata=sampling_metadata)
         text_tokens = text_sampler_output.sampled_token_ids  # [num_reqs, 1]
 
         # 2. Get audio logits (stored by forward() in self._pending_audio_logits)
         audio_logits = self._pending_audio_logits
-
         if audio_logits is None:
-            # No audio logits available (shouldn't happen in normal operation)
             return text_sampler_output
 
-        # 3. Sample audio token
-        if self._generation_step < self._audio_delay:
-            # First 6 tokens: force BLANK (token 18)
-            audio_tokens = torch.full_like(text_tokens, self._blank_token_id)
+        # 3. Process each request's tokens following reference implementation logic
+        for batch_i in batch_row_indices:
+            # Get or create state for this slot
+            state = self._audio_state.setdefault(
+                batch_i,
+                {"generation_step": 0, "audio_out_ids": None}
+            )
+
+            # Check if text stream already finished for this request
+            text_finished = self._text_stream_finished.get(batch_i, False)
+
+            # Get the sampled text token for this request
+            if text_tokens.numel() > batch_i:
+                text_token_id = text_tokens[batch_i].item()
+            else:
+                continue  # Skip if no token for this request
+
+            # Handle text stream termination (reference: kimia.py line 134-139)
+            if text_finished:
+                # Text stream already finished, replace token with BLANK
+                text_token_id = self._blank_token_id
+                text_tokens[batch_i] = self._blank_token_id
+            elif text_token_id == self._text_eos_id:
+                # Text stream just finished, mark it and keep the EOS token
+                self._text_stream_finished[batch_i] = True
+            # else: text stream still active, keep the sampled token
+
+            # 4. Handle audio delay and sampling (reference: kimia.py line 143-149)
+            step = state["generation_step"]
+
+            if step < self._audio_delay:
+                # First 6 tokens: force BLANK (reference: kimia.py line 143-144)
+                audio_token_id = self._blank_token_id
+            else:
+                # Sample from audio logits using argmax (greedy for now)
+                audio_logits_filtered = audio_logits[batch_i:batch_i+1, self._token_offset:]  # [1, 16384]
+                audio_token_idx = torch.argmax(audio_logits_filtered, dim=-1, keepdim=True)  # [1, 1]
+                audio_token_id = audio_token_idx.item() + self._token_offset
+
+            # 5. Append to cumulative audio history for this slot
+            audio_token = torch.tensor([[audio_token_id]], device=logits.device)
+            if state["audio_out_ids"] is None:
+                state["audio_out_ids"] = audio_token.clone()  # [1, 1]
+            else:
+                state["audio_out_ids"] = torch.cat(
+                    [state["audio_out_ids"], audio_token], dim=-1
+                )  # [1, T_so_far]
+
+            # 6. Increment step counter for this slot
+            state["generation_step"] = step + 1
+
+            # Debug logging (only for first few steps or periodically)
+            if step <= 10 or step % 50 == 0:
+                print(f"[KimiAudio] slot {batch_i} step {step+1}: "
+                      f"text_token={text_token_id}, audio_token={audio_token_id}, "
+                      f"text_finished={text_finished}")
+
+        # Store last audio tokens for backward compatibility
+        last_audio_tokens = []
+        for batch_i in batch_row_indices:
+            if batch_i in self._audio_state and self._audio_state[batch_i]["audio_out_ids"] is not None:
+                last_token = self._audio_state[batch_i]["audio_out_ids"][:, -1:]
+                last_audio_tokens.append(last_token)
+
+        if last_audio_tokens:
+            self._last_audio_tokens = torch.cat(last_audio_tokens, dim=0)
         else:
-            # Sample from audio logits using argmax (greedy for now)
-            # audio_logits shape: [num_reqs, 168448] (full vocab)
-            # We need to extract only the audio portion [152064, 168447]
-            audio_logits_filtered = audio_logits[:, self._token_offset:]  # [num_reqs, 16384]
-            audio_token_indices = torch.argmax(audio_logits_filtered, dim=-1, keepdim=True)  # [num_reqs, 1]
-            # Add offset to get actual audio token IDs [152064, 168447]
-            audio_tokens = audio_token_indices + self._token_offset
+            self._last_audio_tokens = None
 
-        # 4. Store audio token for next step's embed_input_ids()
-        self._pending_audio_token = audio_tokens
-
-        # 5. Increment generation step
-        self._generation_step += 1
-
-        # 6. Debug logging
-        if self._generation_step <= 10 or self._generation_step % 50 == 0:
-            print(f"[KimiAudio] sample step {self._generation_step}: "
-                  f"text_token={text_tokens[0].item() if text_tokens.numel() > 0 else 'N/A'}, "
-                  f"audio_token={audio_tokens[0].item() if audio_tokens.numel() > 0 else 'N/A'}")
-
-        # 7. Return text tokens (drives the engine)
+        # Return text tokens (drives the engine)
         return text_sampler_output
 
     def make_omni_output(
@@ -577,17 +739,21 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         """Package dual-stream output into OmniOutput.
 
         Includes audio tokens for feedback to next step via next_token_id.
+        Uses per-slot audio tokens from _last_audio_tokens.
         """
         text_hidden = model_outputs.get("text_hidden_states")
         audio_logits = model_outputs.get("audio_logits")
+
+        # Get the last audio tokens for each request (per-slot)
+        last_audio_tokens = getattr(self, "_last_audio_tokens", None)
 
         return OmniOutput(
             text_hidden_states=text_hidden,
             multimodal_outputs={
                 "audio_logits": audio_logits,
-                "audio_tokens": self._pending_audio_token,
+                "audio_tokens": last_audio_tokens,
             },
-            next_token_id=self._pending_audio_token,  # Critical for feedback!
+            next_token_id=last_audio_tokens,  # Critical for feedback!
         )
 
     def postprocess(
@@ -599,21 +765,46 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         """Per-request postprocessing to sync state.
 
         Returns update dict that gets merged into model_intermediate_buffer.
+        Returns per-slot audio and text stream state for each request.
         """
-        return {
-            "audio_token": self._pending_audio_token,
-            "generation_step": self._generation_step,
-        }
+        state = getattr(self, "_audio_state", None)
+        text_finished = getattr(self, "_text_stream_finished", None)
+
+        if not state and not text_finished:
+            return {}
+
+        # Get the number of requests from req_infos
+        num_reqs = req_infos.get("num_reqs", 1)
+
+        per_req_state = {}
+        for batch_i in range(num_reqs):
+            # Audio state
+            if state:
+                req_state = state.get(batch_i)
+                if req_state and req_state.get("audio_out_ids") is not None:
+                    last_audio_token = req_state["audio_out_ids"][:, -1:].item()
+                    per_req_state[f"audio_token_{batch_i}"] = last_audio_token
+                    per_req_state[f"generation_step_{batch_i}"] = req_state["generation_step"]
+
+            # Text stream termination state
+            if text_finished:
+                is_finished = text_finished.get(batch_i, False)
+                per_req_state[f"text_finished_{batch_i}"] = is_finished
+
+        return per_req_state
 
     def on_requests_finished(self, finished_req_ids: list[str]) -> None:
         """Reset state for finished requests.
 
-        Prevents cross-request contamination.
+        Note: With per-slot state management, slot reuse is detected inline in sample()
+        via _slot_output_len. This method is kept for compatibility but does minimal cleanup.
         """
-        # Reset dual streaming state
-        self._pending_audio_token = None
+        # Clear pending logits (will be repopulated on next forward pass)
         self._pending_audio_logits = None
-        self._generation_step = 0
+        # Note: We don't clear _audio_state, _slot_output_len, or _text_stream_finished here because
+        # slot reuse detection in sample() handles cleanup automatically.
+        # This prevents issues where on_requests_finished() is called while
+        # other requests are still in flight.
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
         """Load weights from checkpoint."""
