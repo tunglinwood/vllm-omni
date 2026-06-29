@@ -55,6 +55,7 @@ from vllm_omni.model_executor.models.hunyuan_image3.pipeline import (
     HUNYUAN_IMAGE3_PIPELINE,
 )
 from vllm_omni.model_executor.models.indextts2.pipeline import INDEXTTS2_PIPELINE
+from vllm_omni.model_executor.models.kimi_audio.pipeline import KIMI_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.lance.pipeline import LANCE_PIPELINE
 from vllm_omni.model_executor.models.mimo_audio.pipeline import MIMO_AUDIO_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
@@ -95,6 +96,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "qwen3_omni_moe": resolve_qwen3_omni_pipeline,
     "qwen3_tts": QWEN3_TTS_PIPELINE,
     "covo_audio": COVO_AUDIO_PIPELINE,
+    "kimi_audio": KIMI_AUDIO_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,

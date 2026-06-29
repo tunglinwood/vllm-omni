@@ -415,3 +415,60 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+def _register_omni_models_early():
+    """Register omni models to vllm at import time to override upstream models."""
+    try:
+        from vllm.model_executor.models import ModelRegistry
+        from vllm_omni.model_executor.models.registry import _OMNI_MODELS
+
+        supported_archs = ModelRegistry.get_supported_archs()
+        for arch, (mod_folder, mod_relname, cls_name) in _OMNI_MODELS.items():
+            if arch not in supported_archs:
+                ModelRegistry.register_model(
+                    arch,
+                    f"vllm_omni.model_executor.models.{mod_folder}.{mod_relname}:{cls_name}"
+                )
+
+        # Override upstream Kimi Audio model with vllm-omni version
+        ModelRegistry.register_model(
+            "MoonshotKimiaForCausalLM",
+            "vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm:KimiAudioLLMForConditionalGeneration"
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_register_omni_models_early()
+
+
+def _patch_tokenizer_special_tokens_map():
+    """Patch transformers tokenizer to handle missing _special_tokens_map.
+
+    Some custom tokenizers (like Kimi's TikTokenTokenizer) try to set special tokens
+    before calling super().__init__(), which causes AttributeError because _special_tokens_map
+    doesn't exist yet. This patch makes __setattr__ more robust.
+    """
+    try:
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+        # Save the original __setattr__
+        original_setattr = PreTrainedTokenizerBase.__setattr__
+
+        def patched_setattr(self, key, value):
+            # If trying to set a special token and _special_tokens_map doesn't exist, create it
+            if key in ('bos_token', 'eos_token', 'unk_token', 'pad_token', 'additional_special_tokens'):
+                if not hasattr(self, '_special_tokens_map'):
+                    object.__setattr__(self, '_special_tokens_map', {})
+            return original_setattr(self, key, value)
+
+        # Replace __setattr__
+        PreTrainedTokenizerBase.__setattr__ = patched_setattr
+        _PATCH_LOGGER.info("Patched tokenizer __setattr__ to handle missing _special_tokens_map")
+
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_patch_tokenizer_special_tokens_map()

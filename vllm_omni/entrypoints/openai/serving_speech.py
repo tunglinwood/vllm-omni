@@ -78,6 +78,7 @@ logger = init_logger(__name__)
 
 # TTS Configuration
 _MING_TTS_MODEL_ARCHS = {"MingTTSForConditionalGeneration"}
+_KIMI_AUDIO_MODEL_ARCHS = {"KimiAudioDetokenizerForConditionalGeneration"}
 _VOXTRAL_TTS_MODEL_STAGES = {"audio_generation"}
 _QWEN3_TTS_MODEL_STAGES = {"qwen3_tts"}
 _FISH_TTS_MODEL_STAGES = {"fish_speech_slow_ar"}
@@ -705,6 +706,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return "ming_flash_omni_tts"
         if model_arch in _MING_TTS_MODEL_ARCHS:
             return "ming_tts"
+        if model_arch in _KIMI_AUDIO_MODEL_ARCHS:
+            return "kimi_audio"
         if model_stage in _MOSS_TTS_MODEL_STAGES:
             return "moss_tts_nano"
         if model_stage in _MOSS_TTS_FULL_MODEL_STAGES:

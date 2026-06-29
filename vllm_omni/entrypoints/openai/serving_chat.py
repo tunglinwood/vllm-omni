@@ -2468,7 +2468,23 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         final_res = omni_outputs.request_output
         # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
         # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        mm_output = final_res.outputs[0].multimodal_output
+        mm_output = getattr(final_res.outputs[0], "multimodal_output", None)
+        if mm_output is None:
+            # No audio was generated (model only produced text)
+            # Return text-only response
+            text_body = ""
+            for output in final_res.outputs:
+                text_body += output.text or ""
+            message = ChatMessage(role=role, content=text_body)
+            return [
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=message,
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ]
         audio_data = mm_output.get("audio")
         if isinstance(audio_data, list):
             if not audio_data:
