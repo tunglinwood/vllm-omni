@@ -597,6 +597,8 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                         audio_features = multimodal_embeddings[0]  # [audio_seq_len, hidden_size]
                         num_audio_positions = is_multimodal.sum().item()
 
+                        print(f"[KimiAudio] embed_input_ids: audio_features shape={audio_features.shape}, num_audio_positions={num_audio_positions}", flush=True)
+
                         # Check if audio features match the number of multimodal positions
                         if audio_features.shape[0] == num_audio_positions:
                             # Create output tensor starting with text embeddings
@@ -604,13 +606,16 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                             # Place audio features at multimodal positions
                             multimodal_positions = torch.where(is_multimodal)[0]
+                            print(f"[KimiAudio] embed_input_ids: placing audio at positions {multimodal_positions.tolist()}", flush=True)
                             result_emb[multimodal_positions] = audio_features
 
                             # Apply √2 scaling to multimodal positions
                             result_emb[multimodal_positions] = result_emb[multimodal_positions] * (2 ** 0.5)
 
                             text_emb = result_emb
+                            print(f"[KimiAudio] embed_input_ids: ✅ Audio features placed successfully", flush=True)
                         else:
+                            print(f"[KimiAudio] embed_input_ids: ❌ Shape mismatch! audio_features.shape[0]={audio_features.shape[0]} != num_audio_positions={num_audio_positions}", flush=True)
                             # Fallback: shapes don't match, use original logic with broadcasting
                             whisper_emb = multimodal_embeddings.squeeze(0)
                             scaled_emb = (text_emb + whisper_emb) * (2 ** 0.5)
@@ -633,9 +638,12 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         if not state:
             # No audio state yet (first step or no audio generation)
             inputs_embeds = text_emb
+            print(f"[KimiAudio] embed_input_ids: No audio state, using text_emb only", flush=True)
         else:
             embed_weight = self.model.model.embed_tokens.weight
             num_tokens = text_emb.shape[0]
+
+            print(f"[KimiAudio] embed_input_ids: Audio state exists, applying dual stream fusion for {num_tokens} tokens", flush=True)
 
             # Determine batch row indices for each token position
             # In vLLM, input_ids is typically [num_tokens] for prefill or [num_reqs, 1] for decode
@@ -651,6 +659,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             inputs_embeds = text_emb.clone()
 
             # For each position, add the audio embedding from the corresponding request's state
+            audio_tokens_added = 0
             for pos in range(num_tokens):
                 batch_i = batch_row_indices[pos] if pos < len(batch_row_indices) else 0
                 req_state = state.get(batch_i)
@@ -671,6 +680,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 # Embed the audio token and ADD to text embedding (dual stream fusion)
                 audio_emb = embed_weight[last_audio_token_id]  # [hidden_dim]
                 inputs_embeds[pos] = inputs_embeds[pos] + audio_emb.to(dtype=inputs_embeds.dtype)
+                audio_tokens_added += 1
+
+            print(f"[KimiAudio] embed_input_ids: Added {audio_tokens_added} audio token embeddings", flush=True)
 
         return inputs_embeds
 
@@ -782,9 +794,11 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 # Text stream already finished, replace token with BLANK
                 text_token_id = self._blank_token_id
                 text_tokens[batch_i] = self._blank_token_id
+                print(f"[KimiAudio] Text stream finished, replacing token with BLANK", flush=True)
             elif text_token_id == self._text_eos_id:
                 # Text stream just finished, mark it and keep the EOS token
                 self._text_stream_finished[batch_i] = True
+                print(f"[KimiAudio] Text stream just finished (EOS token detected)", flush=True)
             # else: text stream still active, keep the sampled token
 
             # 4. Handle audio delay and sampling (reference: kimia.py line 143-149)
@@ -830,6 +844,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             self._last_audio_tokens = None
 
         # Return text tokens (drives the engine)
+        # Debug: log what we're returning
+        if batch_row_indices and text_tokens.numel() > 0:
+            print(f"[KimiAudio] sample() returning text_tokens: {text_tokens.tolist()}", flush=True)
         return text_sampler_output
 
     def make_omni_output(
