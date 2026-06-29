@@ -61,6 +61,105 @@ def _patch_kimi_tokenizer():
 _patch_kimi_tokenizer()
 
 
+# Monkey-patch the output length calculation to match reference implementation
+def _patch_output_length_calculation():
+    """Patch the output length calculation to match reference implementation."""
+    try:
+        import vllm.model_executor.models.kimi_audio as kimi_audio_module
+
+        # Save original function
+        original_func = kimi_audio_module._get_feat_extract_output_lengths
+
+        def _custom_get_feat_extract_output_lengths(input_lengths: torch.Tensor) -> torch.Tensor:
+            """Custom output length calculation matching reference implementation.
+
+            Reference: token_len = (L - 1) // (160 * 8) + 1, then * 4
+            where L is audio length in samples.
+            Whisper produces 100 mel frames per second (16000 samples / 160 hop = 100 frames).
+            So L = input_lengths * 160 (convert mel frames to samples).
+            """
+            # input_lengths is in mel frames, convert to audio samples
+            L = input_lengths * 160
+            # Reference formula
+            token_len = (L - 1) // (160 * 8) + 1
+            return token_len * 4
+
+        # Replace the function
+        kimi_audio_module._get_feat_extract_output_lengths = _custom_get_feat_extract_output_lengths
+
+        print("Patched _get_feat_extract_output_lengths to match reference implementation", flush=True)
+    except Exception as e:
+        print(f"Warning: Failed to patch output length calculation: {e}", flush=True)
+
+
+# Apply the patch
+_patch_output_length_calculation()
+
+
+class KimiAudioCustomWhisperEncoder(nn.Module):
+    """Custom Whisper encoder that matches reference implementation.
+
+    Key differences from standard Whisper:
+    1. Processes audio in 30-second chunks
+    2. Slices encoder output to token_len * 4
+    3. token_len = (L - 1) // (160 * 8) + 1 where L is audio samples
+    """
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        from vllm.model_executor.models.kimi_audio import KimiAudioWhisperEncoder
+
+        # Use the upstream encoder as base
+        self.encoder = KimiAudioWhisperEncoder(
+            vllm_config=vllm_config,
+            prefix=prefix,
+        )
+
+    def forward(self, input_features: torch.Tensor) -> torch.Tensor:
+        """Forward pass with custom slicing logic.
+
+        Args:
+            input_features: [B, 128, T] mel spectrogram
+
+        Returns:
+            features: [B, token_len * 4, hidden_dim] sliced features
+        """
+        # input_features shape: [B, 128, T] where T is number of mel frames
+        batch_size, num_mel_bins, num_frames = input_features.shape
+
+        # Run through standard encoder
+        # Output: [B, num_frames // 2, hidden_dim] (due to stride-2 conv)
+        encoder_output = self.encoder(input_features)
+
+        # Calculate token_len based on reference implementation
+        # Reference: token_len = (L - 1) // (160 * 8) + 1
+        # where L is audio length in samples
+        # Whisper uses 10ms hop (160 samples at 16kHz), so:
+        # L = num_frames * 160 (approximate)
+        L = num_frames * 160
+        token_len = (L - 1) // (160 * 8) + 1
+        target_length = token_len * 4
+
+        # Slice or pad to target length
+        actual_length = encoder_output.shape[1]
+
+        if actual_length >= target_length:
+            # Slice to target length
+            encoder_output = encoder_output[:, :target_length, :]
+        else:
+            # Pad with zeros if needed
+            padding = torch.zeros(
+                batch_size,
+                target_length - actual_length,
+                encoder_output.shape[2],
+                dtype=encoder_output.dtype,
+                device=encoder_output.device,
+            )
+            encoder_output = torch.cat([encoder_output, padding], dim=1)
+
+        return encoder_output
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     KimiAudioMultiModalProcessor,
     info=KimiAudioProcessingInfo,
@@ -95,15 +194,17 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         # Import upstream vllm components
         from vllm.model_executor.models.kimi_audio import (
-            KimiAudioWhisperEncoder,
             KimiAudioMultiModalProjector,
         )
 
-        # Audio input processing (reuse from upstream vllm)
-        self.audio_tower = KimiAudioWhisperEncoder(
+        # Use custom Whisper encoder that matches reference implementation
+        self.audio_tower = KimiAudioCustomWhisperEncoder(
             vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "audio_tower"),
+            prefix=f"{prefix}model.audio_tower",
         )
+
+        # Audio input processing (reuse from upstream vllm)
+        # Note: audio_tower is already set above, don't overwrite
 
         # Project Whisper output (1280) to VQ adaptor input (5120)
         # Get Whisper output dimension from the whisper config subfolder
