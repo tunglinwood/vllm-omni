@@ -860,17 +860,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if not audio_parts:
             return messages, None
 
-        print(f"[ServingChat] Found {len(audio_parts)} audio parts", flush=True)
+        logger.debug("[ServingChat] Found %d audio parts", len(audio_parts))
 
-        # Materialize and tokenize audio
+        # Materialize audio (decode base64, load from URL, etc.)
+        # Tokenization is handled by the model process to avoid cross-process issues
         try:
-            # Materialize audio (decode base64, load from URL, etc.)
             materialized_audio = []
             for audio_part in audio_parts:
                 if isinstance(audio_part, str):
                     if audio_part.startswith("data:"):
                         # Data URL format: data:audio/wav;base64,<base64_data>
-                        # Extract base64 data after the comma
                         comma_idx = audio_part.find(",")
                         if comma_idx != -1:
                             base64_data = audio_part[comma_idx + 1:]
@@ -892,58 +891,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     # Already materialized or dict with audio data
                     materialized_audio.append(audio_part)
 
-            # Load Glm4Tokenizer and tokenize audio
-            # Use the reference implementation's tokenizer
-            import sys
-            sys.path.insert(0, "/root/learning/Kimi-Audio")
-            from kimia_infer.models.tokenizer.glm4_tokenizer import Glm4Tokenizer
-            import torch
-
-            # Load tokenizer (cache it to avoid reloading)
-            if not hasattr(self, "_audio_tokenizer"):
-                print(f"[ServingChat] Loading Glm4Tokenizer...", flush=True)
-                self._audio_tokenizer = Glm4Tokenizer("THUDM/glm-4-voice-tokenizer")
-                self._audio_tokenizer = self._audio_tokenizer.to(torch.cuda.current_device())
-                print(f"[ServingChat] ✅ Glm4Tokenizer loaded on {torch.cuda.current_device()}", flush=True)
-
-            # Tokenize each audio file
-            all_audio_tokens = []
-            for audio_bytes in materialized_audio:
-                # Save to temporary file for tokenizer
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    tmp.write(audio_bytes)
-                    tmp_path = tmp.name
-
-                try:
-                    # Tokenize audio using Glm4Tokenizer
-                    audio_tokens = self._audio_tokenizer.tokenize(audio_path=tmp_path)
-                    # Add offset to get actual token IDs (152064)
-                    audio_tokens = audio_tokens + 152064
-                    # Convert to list
-                    audio_tokens_list = audio_tokens.squeeze(0).cpu().numpy().tolist()
-                    all_audio_tokens.extend(audio_tokens_list)
-                    print(f"[ServingChat] Tokenized audio into {len(audio_tokens_list)} tokens", flush=True)
-                    if len(audio_tokens_list) > 0:
-                        print(f"[ServingChat] First 5 tokens: {audio_tokens_list[:5]}", flush=True)
-                finally:
-                    os.unlink(tmp_path)
-
-            # Store tokenized audio for model to access (also pass raw audio through deferred data)
-            from vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm import KimiAudioLLMForConditionalGeneration
-            KimiAudioLLMForConditionalGeneration._pending_audio_tokens = all_audio_tokens
-
-            print(f"[ServingChat] ✅ Stored {len(all_audio_tokens)} audio tokens for model", flush=True)
-            if len(all_audio_tokens) > 0:
-                print(f"[ServingChat] First 5 tokens: {all_audio_tokens[:5]}", flush=True)
+            logger.debug("[ServingChat] Materialized %d audio items for model tokenization", len(materialized_audio))
 
             # Return stripped messages and deferred data with raw audio bytes
-            # The model will receive this through additional_information and can tokenize it
+            # The model will receive this through additional_information and tokenize it
             return stripped_messages, {"audio": materialized_audio}
 
         except Exception as e:
-            print(f"[ServingChat] ❌ Failed to process audio: {e}", flush=True)
-            traceback.print_exc()
-            return messages, None
+            logger.error("[ServingChat] Failed to process audio: %s", e)
+            # Return stripped messages without audio parts to avoid downstream errors
+            return stripped_messages, None
 
     async def _prepare_multistage_multimodal_inputs(
         self,

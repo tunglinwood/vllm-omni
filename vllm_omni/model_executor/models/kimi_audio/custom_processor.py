@@ -7,11 +7,14 @@ from transformers import BatchFeature
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.inputs import MultiModalDataDict
+from vllm.logger import init_logger
 from vllm.model_executor.models.kimi_audio import (
     KimiAudioMultiModalProcessor as BaseKimiAudioMultiModalProcessor,
     KimiAudioProcessingInfo,
     KimiAudioDummyInputsBuilder,
 )
+
+logger = init_logger(__name__)
 
 
 class CustomKimiAudioMultiModalProcessor(BaseKimiAudioMultiModalProcessor):
@@ -23,12 +26,12 @@ class CustomKimiAudioMultiModalProcessor(BaseKimiAudioMultiModalProcessor):
         mm_data: MultiModalDataDict,
     ) -> dict[str, MultiModalFieldConfig]:
         """Override to add audio_tokens field."""
-        print(f"[CustomProcessor] _get_mm_fields_config called with mm_data keys: {list(mm_data.keys())}", flush=True)
+        logger.debug("_get_mm_fields_config called with mm_data keys: %s", list(mm_data.keys()))
 
         # Get base config from parent
         base_config = super()._get_mm_fields_config(prompt, mm_data)
 
-        print(f"[CustomProcessor] Base config keys: {list(base_config.keys())}", flush=True)
+        logger.debug("Base config keys: %s", list(base_config.keys()))
 
         # Add audio_tokens field if present
         if "audio_tokens" in mm_data:
@@ -36,7 +39,7 @@ class CustomKimiAudioMultiModalProcessor(BaseKimiAudioMultiModalProcessor):
                 batched=False,
                 modalities=("audio",),
             )
-            print(f"[CustomProcessor] ✅ Added audio_tokens to mm_fields_config", flush=True)
+            logger.debug("Added audio_tokens to mm_fields_config")
 
         return base_config
 
@@ -48,20 +51,20 @@ class CustomKimiAudioMultiModalProcessor(BaseKimiAudioMultiModalProcessor):
         tok_kwargs: dict[str, Any],
     ) -> BatchFeature:
         """Override to pass audio_tokens through."""
-        print(f"[CustomProcessor] _call_hf_processor called with mm_data keys: {list(mm_data.keys())}", flush=True)
+        logger.debug("_call_hf_processor called with mm_data keys: %s", list(mm_data.keys()))
 
         # Call parent processor to get whisper features
         hf_inputs = super()._call_hf_processor(
             prompt, mm_data, mm_kwargs, tok_kwargs
         )
 
-        print(f"[CustomProcessor] After parent processor, hf_inputs keys: {list(hf_inputs.keys())}", flush=True)
+        logger.debug("After parent processor, hf_inputs keys: %s", list(hf_inputs.keys()))
 
         # Pass through audio_tokens if present
         if "audio_tokens" in mm_data:
             hf_inputs["audio_tokens"] = mm_data["audio_tokens"]
-            print(f"[CustomProcessor] ✅ Added audio_tokens to hf_inputs: {len(mm_data['audio_tokens'])} tokens", flush=True)
+            logger.debug("Added audio_tokens to hf_inputs: %d tokens", len(mm_data['audio_tokens']))
         else:
-            print(f"[CustomProcessor] No audio_tokens in mm_data", flush=True)
+            logger.debug("No audio_tokens in mm_data")
 
         return hf_inputs
