@@ -298,18 +298,16 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         # Audio tokenizer for discrete audio tokens
         try:
-            from transformers import AutoTokenizer
+            import sys
+            sys.path.insert(0, '/root/learning/Kimi-Audio')
+            from kimia_infer.models.tokenizer.glm4_tokenizer import Glm4Tokenizer
             logger.info("Loading Glm4Tokenizer for discrete audio tokenization")
-            self.audio_tokenizer = AutoTokenizer.from_pretrained(
-                "THUDM/glm-4-voice-tokenizer",
-                trust_remote_code=True
-            )
-            if hasattr(self.audio_tokenizer, 'to'):
-                import torch
-                self.audio_tokenizer = self.audio_tokenizer.to(torch.cuda.current_device())
+            self.audio_tokenizer = Glm4Tokenizer("THUDM/glm-4-voice-tokenizer")
+            import torch
+            self.audio_tokenizer = self.audio_tokenizer.to(torch.cuda.current_device())
             logger.info("Glm4Tokenizer loaded successfully")
         except Exception as e:
-            logger.warning("Failed to load Glm4Tokenizer: %s. Audio tokenization unavailable.", e)
+            logger.warning("Failed to load Glm4Tokenizer: %s. Audio tokenization unavailable.", e, exc_info=True)
             self.audio_tokenizer = None
 
         # Store audio tokens for current request (will be set in _parse_and_validate_audio_input)
@@ -362,6 +360,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                         raw_audio = audio_data_list[0]
                         logger.info("forward: Raw audio type: %s, size: %s", type(raw_audio),
                                    len(raw_audio) if hasattr(raw_audio, '__len__') else 'N/A')
+                        logger.info("forward: Raw audio content: %s", str(raw_audio)[:500])
 
                         discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
                         if discrete_tokens is not None:
@@ -722,8 +721,23 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 audio_path = temp_path
                 logger.info("  Saved to temp file: %s", audio_path)
             elif isinstance(raw_audio, str):
-                audio_path = raw_audio
-                logger.info("  Using audio path: %s", audio_path)
+                # Check if it's a data URL
+                if raw_audio.startswith('data:'):
+                    # Data URL format: data:audio/wav;base64,...
+                    import base64
+                    logger.info("  Processing data URL")
+                    # Extract base64 data after the comma
+                    comma_idx = raw_audio.find(',')
+                    if comma_idx == -1:
+                        logger.error("❌ Invalid data URL format")
+                        return None
+                    b64_data = raw_audio[comma_idx + 1:]
+                    audio_bytes = base64.b64decode(b64_data)
+                    # Recursively process as bytes
+                    return self._tokenize_audio_to_discrete_tokens(audio_bytes)
+                else:
+                    audio_path = raw_audio
+                    logger.info("  Using audio path: %s", audio_path)
             elif isinstance(raw_audio, np.ndarray):
                 wav_tensor = torch.from_numpy(raw_audio).float()
                 if wav_tensor.dim() == 1:
@@ -745,6 +759,17 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 sf.write(temp_path, wav_for_sf, 16000)
                 audio_path = temp_path
                 logger.info("  Converted tensor to temp file: %s", audio_path)
+            elif isinstance(raw_audio, list):
+                # List of audio items - take the first one
+                if len(raw_audio) > 0:
+                    logger.info("  Extracting first item from list of %d items", len(raw_audio))
+                    logger.info("  First item type: %s", type(raw_audio[0]))
+                    if isinstance(raw_audio[0], (list, dict)):
+                        logger.info("  First item: %s", str(raw_audio[0])[:200])
+                    return self._tokenize_audio_to_discrete_tokens(raw_audio[0])
+                else:
+                    logger.error("❌ Empty audio list")
+                    return None
             else:
                 logger.error("❌ Unsupported audio type: %s", type(raw_audio))
                 return None
