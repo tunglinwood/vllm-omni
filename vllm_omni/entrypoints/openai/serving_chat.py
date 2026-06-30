@@ -1,7 +1,10 @@
 import asyncio
 import base64
 import json
+import os
+import tempfile
 import time
+import traceback
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from dataclasses import fields, is_dataclass
@@ -10,6 +13,7 @@ from io import BytesIO
 from typing import Any, Final, cast
 
 import jinja2
+import requests
 import torch
 from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
@@ -875,7 +879,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             audio_bytes = base64.b64decode(audio_part)
                     elif audio_part.startswith(("http://", "https://")):
                         # Load from URL
-                        import requests
                         response = requests.get(audio_part)
                         response.raise_for_status()
                         audio_bytes = response.content
@@ -907,7 +910,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             all_audio_tokens = []
             for audio_bytes in materialized_audio:
                 # Save to temporary file for tokenizer
-                import tempfile
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                     tmp.write(audio_bytes)
                     tmp_path = tmp.name
@@ -924,10 +926,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     if len(audio_tokens_list) > 0:
                         print(f"[ServingChat] First 5 tokens: {audio_tokens_list[:5]}", flush=True)
                 finally:
-                    import os
                     os.unlink(tmp_path)
 
-            # Store tokenized audio for model to access
+            # Store tokenized audio for model to access (also pass raw audio through deferred data)
             from vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm import KimiAudioLLMForConditionalGeneration
             KimiAudioLLMForConditionalGeneration._pending_audio_tokens = all_audio_tokens
 
@@ -935,12 +936,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if len(all_audio_tokens) > 0:
                 print(f"[ServingChat] First 5 tokens: {all_audio_tokens[:5]}", flush=True)
 
-            # Return stripped messages and empty deferred data (audio is handled via class variable)
-            return stripped_messages, {}
+            # Return stripped messages and deferred data with raw audio bytes
+            # The model will receive this through additional_information and can tokenize it
+            return stripped_messages, {"audio": materialized_audio}
 
         except Exception as e:
             print(f"[ServingChat] ❌ Failed to process audio: {e}", flush=True)
-            import traceback
             traceback.print_exc()
             return messages, None
 
@@ -1016,8 +1017,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     print("[ServingChat] ✅ Glm4Tokenizer loaded", flush=True)
 
                 # Tokenize audio
-                import tempfile
-                import os
                 audio_path = None
                 try:
                     # Save raw audio to temp file

@@ -449,7 +449,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         try:
             print(f"[KimiAudio] Text path: hidden_states shape={text_hidden_states.shape}, "
                   f"mean={text_hidden_states.mean().item():.4f}, std={text_hidden_states.std().item():.4f}")
-        except:
+        except Exception:
             print(f"[KimiAudio] Text path: shape={text_hidden_states.shape}")
 
         # 5. Audio path: 6 MIMO layers → mimo_output
@@ -471,7 +471,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             print(f"[KimiAudio] Audio path: hidden_states shape={audio_hidden_states.shape}, "
                   f"audio_logits shape={audio_logits.shape}, "
                   f"mean={audio_hidden_states.mean().item():.4f}, std={audio_hidden_states.std().item():.4f}")
-        except:
+        except Exception:
             print(f"[KimiAudio] Audio path: shape={audio_hidden_states.shape}, logits={audio_logits.shape}")
 
         # Debug: Print top 5 audio logits
@@ -713,7 +713,13 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             import os
 
             # Convert raw audio to file path if needed
-            if isinstance(raw_audio, (str, bytes)):
+            if isinstance(raw_audio, bytes):
+                # Raw audio bytes - save to temp file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    f.write(raw_audio)
+                    temp_path = f.name
+                audio_path = temp_path
+            elif isinstance(raw_audio, str):
                 # Already a file path
                 audio_path = raw_audio
             elif isinstance(raw_audio, np.ndarray):
@@ -754,10 +760,10 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             print(f"[KimiAudio] First 5 tokens: {wav_tokens_list[:5]}", flush=True)
 
             # Clean up temp file if we created one
-            if isinstance(raw_audio, (np.ndarray, torch.Tensor)) and 'temp_path' in locals():
+            if isinstance(raw_audio, (bytes, np.ndarray, torch.Tensor)) and 'temp_path' in locals():
                 try:
                     os.unlink(temp_path)
-                except:
+                except Exception:
                     pass
 
             return wav_tokens_list
@@ -892,7 +898,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                             try:
                                 print(f"  combined_emb (before √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}", flush=True)
-                            except:
+                            except Exception:
                                 pass
 
                             # Scale by sqrt(2)
@@ -900,7 +906,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                             try:
                                 print(f"  combined_emb (after √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}", flush=True)
-                            except:
+                            except Exception:
                                 pass
 
                             # Place back
