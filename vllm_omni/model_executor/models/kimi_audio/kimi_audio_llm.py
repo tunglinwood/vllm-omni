@@ -326,44 +326,71 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         logits_index: Optional[int] = None,
         sampler=None,
         additional_information: Optional[dict] = None,
+        runtime_additional_information: Optional[list] = None,
         **kwargs,
     ) -> OmniOutput:
         """Forward pass with bifurcation at layer 21."""
 
+        # Check both additional_information and runtime_additional_information
+        # runtime_additional_information is a list (one per request in batch)
+        # We need to extract the first element for single-request batch
+        effective_additional_info = additional_information
+        if effective_additional_info is None and runtime_additional_information is not None:
+            if isinstance(runtime_additional_information, list) and len(runtime_additional_information) > 0:
+                effective_additional_info = runtime_additional_information[0]
+            elif isinstance(runtime_additional_information, dict):
+                effective_additional_info = runtime_additional_information
+
         logger.debug("forward: additional_information keys: %s",
-                     list(additional_information.keys()) if additional_information else None)
+                     list(effective_additional_info.keys()) if effective_additional_info else None)
+        logger.debug("forward: runtime_additional_information length: %s",
+                     len(runtime_additional_information) if runtime_additional_information else None)
 
         # Extract raw audio from additional_information and tokenize it
-        if additional_information is not None and self._current_audio_tokens is None:
+        logger.info("forward: effective_additional_info keys: %s",
+                     list(effective_additional_info.keys()) if effective_additional_info else None)
+        logger.info("forward: _current_audio_tokens is None: %s", self._current_audio_tokens is None)
+
+        if effective_additional_info is not None and self._current_audio_tokens is None:
             try:
-                deferred_data = additional_information.get("deferred_multi_modal_data", {})
+                deferred_data = effective_additional_info.get("deferred_multi_modal_data", {})
+                logger.info("forward: deferred_data keys: %s", list(deferred_data.keys()) if deferred_data else None)
                 if deferred_data:
                     audio_data_list = deferred_data.get("audio", [])
+                    logger.info("forward: audio_data_list length: %d", len(audio_data_list) if audio_data_list else 0)
                     if audio_data_list and len(audio_data_list) > 0:
-                        logger.debug("forward: Found %d audio items in deferred data", len(audio_data_list))
                         raw_audio = audio_data_list[0]
-                        logger.debug("forward: Raw audio type: %s", type(raw_audio))
+                        logger.info("forward: Raw audio type: %s, size: %s", type(raw_audio),
+                                   len(raw_audio) if hasattr(raw_audio, '__len__') else 'N/A')
 
                         discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
                         if discrete_tokens is not None:
                             self._current_audio_tokens = discrete_tokens
-                            logger.debug("forward: Tokenized audio into %d discrete tokens", len(discrete_tokens))
+                            logger.info("✅ forward: Tokenized audio into %d discrete tokens", len(discrete_tokens))
+                            logger.info("   First 5 tokens: %s", discrete_tokens[:5])
+                            logger.info("   Last 5 tokens: %s", discrete_tokens[-5:])
                         else:
-                            logger.warning("forward: Could not tokenize audio")
+                            logger.error("❌ forward: Could not tokenize audio")
+                    else:
+                        logger.warning("forward: No audio data in deferred_data")
+                else:
+                    logger.warning("forward: No deferred_data in additional_information")
             except Exception as e:
-                logger.error("ERROR extracting audio from additional_information: %s", e, exc_info=True)
+                logger.error("❌ ERROR extracting audio from additional_information: %s", e, exc_info=True)
 
         # Replace BLANK tokens in input_ids with actual audio tokens
         # This is critical: model expects discrete audio tokens, not BLANK tokens
+        logger.info("forward: _current_audio_tokens available: %s", self._current_audio_tokens is not None)
+        logger.info("forward: input_ids shape: %s", input_ids.shape if input_ids is not None else None)
+
         if self._current_audio_tokens is not None and input_ids is not None:
             try:
                 blank_mask = (input_ids == self._blank_token_id)
                 num_blank_positions = blank_mask.sum().item()
+                logger.info("forward: Found %d BLANK tokens (id=%d) in input_ids", num_blank_positions, self._blank_token_id)
+                logger.info("forward: Have %d audio tokens to insert", len(self._current_audio_tokens))
 
                 if num_blank_positions > 0:
-                    logger.debug("forward: Found %d BLANK tokens, will replace with %d audio tokens",
-                                 num_blank_positions, len(self._current_audio_tokens))
-
                     if len(self._current_audio_tokens) == num_blank_positions:
                         audio_tokens_tensor = torch.tensor(
                             self._current_audio_tokens,
@@ -372,12 +399,14 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                         )
                         input_ids = input_ids.clone()
                         input_ids[blank_mask] = audio_tokens_tensor
-                        logger.debug("Replaced BLANK tokens with discrete audio tokens")
+                        logger.info("✅ Replaced %d BLANK tokens with %d audio tokens", num_blank_positions, len(self._current_audio_tokens))
                     else:
-                        logger.warning("Mismatch: %d BLANK positions but %d audio tokens, using BLANK tokens",
+                        logger.error("❌ MISMATCH: %d BLANK positions but %d audio tokens - cannot replace!",
                                        num_blank_positions, len(self._current_audio_tokens))
+                else:
+                    logger.error("❌ No BLANK tokens found in input_ids - audio will not be processed!")
             except Exception as e:
-                logger.error("ERROR replacing BLANK tokens: %s", e, exc_info=True)
+                logger.error("❌ ERROR replacing BLANK tokens: %s", e, exc_info=True)
 
         # 1. Embed inputs (reuse upstream fusion)
         if inputs_embeds is not None:
@@ -498,6 +527,13 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
         # Process audio through Whisper encoder and VQAdaptor
         audio_embeds = self._process_audio_input(audio_input)
+
+        # Log that audio features successfully reached the model
+        logger.info(
+            "embed_multimodal: Successfully processed audio features -> shape=%s, dtype=%s",
+            list(audio_embeds.shape),
+            audio_embeds.dtype,
+        )
 
         # Return as list of 2D tensors, one per batch item
         if audio_embeds.dim() == 3:
@@ -645,8 +681,10 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         Returns:
             List of discrete audio token IDs, or None if tokenization fails
         """
+        logger.info("_tokenize_audio_to_discrete_tokens: called with type=%s", type(raw_audio))
+
         if self.audio_tokenizer is None:
-            logger.warning("Audio tokenizer not available, cannot tokenize audio")
+            logger.error("❌ Audio tokenizer not available, cannot tokenize audio")
             return None
 
         temp_path = None
@@ -655,52 +693,75 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
             # Convert raw audio to file path for tokenizer
             if isinstance(raw_audio, bytes):
-                # Raw audio bytes - load directly with torchaudio via BytesIO (no temp file)
+                # Raw audio bytes - load with soundfile (more compatible than torchaudio)
                 import io
-                import torchaudio
-                wav_tensor, sr = torchaudio.load(io.BytesIO(raw_audio))
+                import soundfile as sf
+                logger.info("  Loading audio from bytes (size: %d bytes)", len(raw_audio))
+                wav_tensor, sr = sf.read(io.BytesIO(raw_audio), dtype='float32')
+                # Convert to torch tensor and ensure correct shape [channels, samples]
+                wav_tensor = torch.from_numpy(wav_tensor)
+                if wav_tensor.dim() == 1:
+                    wav_tensor = wav_tensor.unsqueeze(0)  # [1, samples]
+                elif wav_tensor.dim() == 2:
+                    wav_tensor = wav_tensor.T  # [samples, channels] -> [channels, samples]
+                logger.info("  Loaded audio: shape=%s, sample_rate=%d", wav_tensor.shape, sr)
                 if sr != 16000:
-                    wav_tensor = torchaudio.functional.resample(wav_tensor, sr, 16000)
-                if wav_tensor.dim() == 2:
-                    wav_tensor = wav_tensor.mean(dim=0, keepdim=True)
-                # Save to temp file for tokenizer
+                    logger.info("  Resampling from %d to 16000 Hz", sr)
+                    # Use scipy for resampling to avoid torchaudio/torchcodec dependency
+                    from scipy import signal
+                    # wav_tensor shape: [channels, samples]
+                    num_samples_16k = int(wav_tensor.shape[1] * 16000 / sr)
+                    wav_resampled = signal.resample(wav_tensor.numpy(), num_samples_16k, axis=1)
+                    wav_tensor = torch.from_numpy(wav_resampled).float()
+                # Save to temp file for tokenizer using soundfile
                 with __import__('tempfile').NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     temp_path = f.name
-                torchaudio.save(temp_path, wav_tensor, 16000)
+                # soundfile expects [samples, channels] format
+                wav_for_sf = wav_tensor.squeeze(0).numpy() if wav_tensor.dim() == 2 else wav_tensor.numpy()
+                sf.write(temp_path, wav_for_sf, 16000)
                 audio_path = temp_path
+                logger.info("  Saved to temp file: %s", audio_path)
             elif isinstance(raw_audio, str):
                 audio_path = raw_audio
+                logger.info("  Using audio path: %s", audio_path)
             elif isinstance(raw_audio, np.ndarray):
                 wav_tensor = torch.from_numpy(raw_audio).float()
                 if wav_tensor.dim() == 1:
                     wav_tensor = wav_tensor.unsqueeze(0)
                 with __import__('tempfile').NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     temp_path = f.name
-                import torchaudio
-                torchaudio.save(temp_path, wav_tensor, 16000)
+                # soundfile expects [samples, channels] format
+                wav_for_sf = wav_tensor.squeeze(0).numpy() if wav_tensor.dim() == 2 else wav_tensor.numpy()
+                sf.write(temp_path, wav_for_sf, 16000)
                 audio_path = temp_path
+                logger.info("  Converted numpy array to temp file: %s", audio_path)
             elif isinstance(raw_audio, torch.Tensor):
                 if raw_audio.dim() == 1:
                     raw_audio = raw_audio.unsqueeze(0)
                 with __import__('tempfile').NamedTemporaryFile(suffix='.wav', delete=False) as f:
                     temp_path = f.name
-                import torchaudio
-                torchaudio.save(temp_path, raw_audio.float(), 16000)
+                # soundfile expects [samples, channels] format
+                wav_for_sf = raw_audio.float().squeeze(0).numpy() if raw_audio.dim() == 2 else raw_audio.float().numpy()
+                sf.write(temp_path, wav_for_sf, 16000)
                 audio_path = temp_path
+                logger.info("  Converted tensor to temp file: %s", audio_path)
             else:
-                logger.error("Unsupported audio type: %s", type(raw_audio))
+                logger.error("❌ Unsupported audio type: %s", type(raw_audio))
                 return None
 
-            logger.debug("Tokenizing audio: %s", audio_path)
+            logger.info("  Calling audio_tokenizer.tokenize(audio_path=%s)", audio_path)
             wav_tokens = self.audio_tokenizer.tokenize(audio_path=audio_path)
+            logger.info("  Raw tokens shape: %s, dtype: %s", wav_tokens.shape, wav_tokens.dtype)
+            logger.info("  Adding token offset: %d", self._token_offset)
             wav_tokens = wav_tokens + self._token_offset
             wav_tokens_list = wav_tokens.squeeze(0).cpu().numpy().tolist()
 
-            logger.debug("Tokenized audio into %d discrete tokens", len(wav_tokens_list))
+            logger.info("✅ Tokenized audio into %d discrete tokens", len(wav_tokens_list))
+            logger.info("   Token range: [%d, %d]", min(wav_tokens_list), max(wav_tokens_list))
             return wav_tokens_list
 
         except Exception as e:
-            logger.error("Failed to tokenize audio: %s", e, exc_info=True)
+            logger.error("❌ Failed to tokenize audio: %s", e, exc_info=True)
             return None
         finally:
             # Clean up temp file

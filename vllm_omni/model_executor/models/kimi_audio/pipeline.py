@@ -44,6 +44,7 @@ KIMI_AUDIO_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
+            input_modalities=("audio",),
             custom_process_input_func=f"{_PROC}.llm2detokenizer",
             sync_process_input_func=f"{_PROC}.llm2detokenizer_token_only",
             sampling_constraints={"detokenize": False},
