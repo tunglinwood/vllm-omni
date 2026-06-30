@@ -26,9 +26,9 @@ stage_args:
     final_output: true
     final_output_type: text
     default_sampling_params:
-      temperature: 0.7
-      top_p: 0.9
-      top_k: 50
+      temperature: 0.0  # Greedy sampling (matches reference implementation)
+      top_p: 1.0
+      top_k: -1  # No top-k filtering when using greedy
       max_tokens: 4096
       seed: 42
       detokenize: true

@@ -651,6 +651,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 messages,
                 request,
             )
+        elif self._is_kimi_audio_model():
+            # For Kimi Audio, always tokenize audio in the API server
+            messages, deferred_multi_modal_data = await self._prepare_kimi_audio_inputs(
+                messages,
+                request,
+            )
 
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
@@ -736,21 +742,32 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         return additional_information
 
     def _needs_multistage_multimodal_split(self) -> bool:
-        return bool(self._deferred_multimodal_modalities())
+        result = bool(self._deferred_multimodal_modalities())
+        print(f"[ServingChat] _needs_multistage_multimodal_split: {result}", flush=True)
+        return result
 
     def _deferred_multimodal_modalities(self) -> set[str]:
         stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        print(f"[ServingChat] _deferred_multimodal_modalities: stage_configs count={len(stage_configs)}", flush=True)
+
         if len(stage_configs) < 2:
             return set()
 
         first_stage_modalities = self._stage_input_modalities(stage_configs[0])
+        print(f"[ServingChat] first_stage_modalities: {first_stage_modalities}", flush=True)
+
         if not first_stage_modalities:
             return set()
 
         downstream_modalities: set[str] = set()
         for stage in stage_configs[1:]:
-            downstream_modalities.update(self._stage_input_modalities(stage))
-        return downstream_modalities - first_stage_modalities
+            stage_mods = self._stage_input_modalities(stage)
+            print(f"[ServingChat] downstream stage modalities: {stage_mods}", flush=True)
+            downstream_modalities.update(stage_mods)
+
+        result = downstream_modalities - first_stage_modalities
+        print(f"[ServingChat] deferred_modalities (downstream - first_stage): {result}", flush=True)
+        return result
 
     @staticmethod
     def _stage_input_modalities(stage: Any) -> set[str]:
@@ -776,13 +793,168 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return {"audio", "image", "video"}
         return set()
 
+    def _is_kimi_audio_model(self) -> bool:
+        """Check if the current model is Kimi Audio."""
+        model_arch = getattr(self.model_config.hf_config, "architectures", [])
+        if isinstance(model_arch, list) and len(model_arch) > 0:
+            arch_name = model_arch[0] if isinstance(model_arch[0], str) else str(model_arch[0])
+            is_kimi = "KimiAudio" in arch_name
+            print(f"[ServingChat] _is_kimi_audio_model: arch_name={arch_name}, is_kimi={is_kimi}", flush=True)
+            return is_kimi
+        print(f"[ServingChat] _is_kimi_audio_model: no architectures found", flush=True)
+        return False
+
+    async def _prepare_kimi_audio_inputs(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        request: ChatLikeRequest | ResponsesRequest,
+    ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
+        """Extract and tokenize audio for Kimi Audio models."""
+        print(f"[ServingChat] _prepare_kimi_audio_inputs called", flush=True)
+
+        # Extract audio from messages
+        audio_parts: list[Any] = []
+        stripped_messages: list[ChatCompletionMessageParam] = []
+
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                stripped_messages.append(message)
+                continue
+
+            stripped_content: list[Any] = []
+            changed = False
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    audio_payload = None
+
+                    if part_type == "audio":
+                        # Direct audio data
+                        audio_payload = part.get("audio") or part.get("data") or part.get("url")
+                    elif part_type == "audio_url":
+                        # Audio URL (may be data URL or HTTP URL)
+                        audio_url_obj = part.get("audio_url")
+                        if isinstance(audio_url_obj, dict):
+                            audio_payload = audio_url_obj.get("url")
+                        elif isinstance(audio_url_obj, str):
+                            audio_payload = audio_url_obj
+
+                    if audio_payload:
+                        audio_parts.append(audio_payload)
+                        changed = True
+                        continue
+                stripped_content.append(part)
+
+            if changed:
+                stripped_message = dict(message)
+                stripped_message["content"] = stripped_content
+                stripped_messages.append(cast(ChatCompletionMessageParam, stripped_message))
+            else:
+                stripped_messages.append(message)
+
+        if not audio_parts:
+            return messages, None
+
+        print(f"[ServingChat] Found {len(audio_parts)} audio parts", flush=True)
+
+        # Materialize and tokenize audio
+        try:
+            # Materialize audio (decode base64, load from URL, etc.)
+            materialized_audio = []
+            for audio_part in audio_parts:
+                if isinstance(audio_part, str):
+                    if audio_part.startswith("data:"):
+                        # Data URL format: data:audio/wav;base64,<base64_data>
+                        # Extract base64 data after the comma
+                        comma_idx = audio_part.find(",")
+                        if comma_idx != -1:
+                            base64_data = audio_part[comma_idx + 1:]
+                            audio_bytes = base64.b64decode(base64_data)
+                        else:
+                            audio_bytes = base64.b64decode(audio_part)
+                    elif audio_part.startswith(("http://", "https://")):
+                        # Load from URL
+                        import requests
+                        response = requests.get(audio_part)
+                        response.raise_for_status()
+                        audio_bytes = response.content
+                    else:
+                        # Base64 encoded
+                        audio_bytes = base64.b64decode(audio_part)
+                    materialized_audio.append(audio_bytes)
+                elif isinstance(audio_part, bytes):
+                    materialized_audio.append(audio_part)
+                else:
+                    # Already materialized or dict with audio data
+                    materialized_audio.append(audio_part)
+
+            # Load Glm4Tokenizer and tokenize audio
+            # Use the reference implementation's tokenizer
+            import sys
+            sys.path.insert(0, "/root/learning/Kimi-Audio")
+            from kimia_infer.models.tokenizer.glm4_tokenizer import Glm4Tokenizer
+            import torch
+
+            # Load tokenizer (cache it to avoid reloading)
+            if not hasattr(self, "_audio_tokenizer"):
+                print(f"[ServingChat] Loading Glm4Tokenizer...", flush=True)
+                self._audio_tokenizer = Glm4Tokenizer("THUDM/glm-4-voice-tokenizer")
+                self._audio_tokenizer = self._audio_tokenizer.to(torch.cuda.current_device())
+                print(f"[ServingChat] ✅ Glm4Tokenizer loaded on {torch.cuda.current_device()}", flush=True)
+
+            # Tokenize each audio file
+            all_audio_tokens = []
+            for audio_bytes in materialized_audio:
+                # Save to temporary file for tokenizer
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+
+                try:
+                    # Tokenize audio using Glm4Tokenizer
+                    audio_tokens = self._audio_tokenizer.tokenize(audio_path=tmp_path)
+                    # Add offset to get actual token IDs (152064)
+                    audio_tokens = audio_tokens + 152064
+                    # Convert to list
+                    audio_tokens_list = audio_tokens.squeeze(0).cpu().numpy().tolist()
+                    all_audio_tokens.extend(audio_tokens_list)
+                    print(f"[ServingChat] Tokenized audio into {len(audio_tokens_list)} tokens", flush=True)
+                    if len(audio_tokens_list) > 0:
+                        print(f"[ServingChat] First 5 tokens: {audio_tokens_list[:5]}", flush=True)
+                finally:
+                    import os
+                    os.unlink(tmp_path)
+
+            # Store tokenized audio for model to access
+            from vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm import KimiAudioLLMForConditionalGeneration
+            KimiAudioLLMForConditionalGeneration._pending_audio_tokens = all_audio_tokens
+
+            print(f"[ServingChat] ✅ Stored {len(all_audio_tokens)} audio tokens for model", flush=True)
+            if len(all_audio_tokens) > 0:
+                print(f"[ServingChat] First 5 tokens: {all_audio_tokens[:5]}", flush=True)
+
+            # Return stripped messages and empty deferred data (audio is handled via class variable)
+            return stripped_messages, {}
+
+        except Exception as e:
+            print(f"[ServingChat] ❌ Failed to process audio: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return messages, None
+
     async def _prepare_multistage_multimodal_inputs(
         self,
         messages: list[ChatCompletionMessageParam],
         request: ChatLikeRequest | ResponsesRequest,
     ) -> tuple[list[ChatCompletionMessageParam], dict[str, Any] | None]:
         """Hide modalities unsupported by stage 0 and stash them for downstream stages."""
+        print(f"[ServingChat] _prepare_multistage_multimodal_inputs called", flush=True)
+
         deferred_modalities = self._deferred_multimodal_modalities()
+        print(f"[ServingChat] deferred_modalities: {deferred_modalities}", flush=True)
+
         deferred_parts: dict[str, list[Any]] = {modality: [] for modality in deferred_modalities}
         stripped_messages: list[ChatCompletionMessageParam] = []
 
@@ -826,6 +998,79 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 modality,
                 parts,
             )
+
+        # NEW: Tokenize audio for Kimi Audio model
+        if "audio" in multi_modal_data and len(multi_modal_data["audio"]) > 0:
+            try:
+                raw_audio = multi_modal_data["audio"][0]
+                print(f"[ServingChat] Raw audio available! Type: {type(raw_audio)}", flush=True)
+
+                # Load Glm4Tokenizer if not already loaded
+                if not hasattr(self, "_kimi_audio_tokenizer"):
+                    from transformers import AutoTokenizer
+                    print("[ServingChat] Loading Glm4Tokenizer for Kimi Audio...", flush=True)
+                    self._kimi_audio_tokenizer = AutoTokenizer.from_pretrained(
+                        "THUDM/glm-4-voice-tokenizer",
+                        trust_remote_code=True
+                    )
+                    print("[ServingChat] ✅ Glm4Tokenizer loaded", flush=True)
+
+                # Tokenize audio
+                import tempfile
+                import os
+                audio_path = None
+                try:
+                    # Save raw audio to temp file
+                    if hasattr(raw_audio, 'numpy'):
+                        # It's a tensor
+                        import numpy as np
+                        wav_data = raw_audio.cpu().numpy() if hasattr(raw_audio, 'cpu') else raw_audio.numpy()
+                    elif hasattr(raw_audio, '__array__'):
+                        # It's a numpy array
+                        wav_data = raw_audio
+                    else:
+                        # Assume it's already a file path or bytes
+                        wav_data = None
+
+                    if wav_data is not None:
+                        import numpy as np
+                        if wav_data.dtype != np.float32:
+                            wav_data = wav_data.astype(np.float32)
+                        if wav_data.ndim == 1:
+                            wav_data = wav_data.reshape(1, -1)
+
+                        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                            audio_path = f.name
+
+                        import torchaudio
+                        wav_tensor = torch.from_numpy(wav_data)
+                        torchaudio.save(audio_path, wav_tensor, 16000)
+
+                    # Tokenize using Glm4Tokenizer
+                    wav_tokens = self._kimi_audio_tokenizer.tokenize(audio_path=audio_path)
+                    wav_tokens = wav_tokens + 152064  # kimia_token_offset
+                    audio_tokens_list = wav_tokens.squeeze(0).cpu().numpy().tolist()
+
+                    # Store in multi_modal_data
+                    multi_modal_data["audio_tokens"] = audio_tokens_list
+                    print(f"[ServingChat] ✅ Tokenized audio into {len(audio_tokens_list)} discrete tokens", flush=True)
+                    print(f"[ServingChat] First 5 tokens: {audio_tokens_list[:5]}", flush=True)
+
+                    # NEW: Store in class variable for model to access
+                    from vllm_omni.model_executor.models.kimi_audio.kimi_audio_llm import KimiAudioLLMForConditionalGeneration
+                    KimiAudioLLMForConditionalGeneration._pending_audio_tokens = audio_tokens_list
+                    print(f"[ServingChat] ✅ Stored audio tokens in class variable", flush=True)
+
+                finally:
+                    # Clean up temp file
+                    if audio_path and os.path.exists(audio_path):
+                        os.unlink(audio_path)
+
+            except Exception as e:
+                print(f"[ServingChat] ❌ ERROR tokenizing audio: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
         return stripped_messages, multi_modal_data
 
     @staticmethod

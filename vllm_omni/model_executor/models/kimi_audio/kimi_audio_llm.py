@@ -18,9 +18,11 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 
-# Import upstream vllm's KimiAudio processor components
+# Import custom processor for Kimi Audio
+from vllm_omni.model_executor.models.kimi_audio.custom_processor import (
+    CustomKimiAudioMultiModalProcessor,
+)
 from vllm.model_executor.models.kimi_audio import (
-    KimiAudioMultiModalProcessor,
     KimiAudioProcessingInfo,
     KimiAudioDummyInputsBuilder,
 )
@@ -161,7 +163,7 @@ class KimiAudioCustomWhisperEncoder(nn.Module):
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    KimiAudioMultiModalProcessor,
+    CustomKimiAudioMultiModalProcessor,
     info=KimiAudioProcessingInfo,
     dummy_inputs=KimiAudioDummyInputsBuilder,
 )
@@ -290,6 +292,28 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         self._text_eos_id: int = 151667  # <|im_kimia_text_eos|>
         self._token_offset: int = 152064  # Audio tokens start here
 
+        # NEW: Audio tokenizer for discrete audio tokens
+        # This is critical: model expects discrete audio tokens, not BLANK tokens
+        try:
+            from transformers import AutoTokenizer
+            print("[KimiAudio] Loading Glm4Tokenizer for discrete audio tokenization...", flush=True)
+            self.audio_tokenizer = AutoTokenizer.from_pretrained(
+                "THUDM/glm-4-voice-tokenizer",
+                trust_remote_code=True
+            )
+            # Move to GPU if possible
+            if hasattr(self.audio_tokenizer, 'to'):
+                import torch
+                self.audio_tokenizer = self.audio_tokenizer.to(torch.cuda.current_device())
+            print("[KimiAudio] ✅ Glm4Tokenizer loaded successfully", flush=True)
+        except Exception as e:
+            print(f"[KimiAudio] ❌ WARNING: Failed to load Glm4Tokenizer: {e}", flush=True)
+            print("[KimiAudio] Audio tokenization will not be available. Model may generate EOS immediately.", flush=True)
+            self.audio_tokenizer = None
+
+        # Store audio tokens for current request (will be set in _parse_and_validate_audio_input)
+        self._current_audio_tokens: Optional[list[int]] = None
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -304,6 +328,88 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         **kwargs,
     ) -> OmniOutput:
         """Forward pass with bifurcation at layer 21."""
+
+        # DEBUG: Check if additional_information is being passed
+        if additional_information is not None:
+            print(f"[KimiAudio] forward: additional_information keys: {list(additional_information.keys())}", flush=True)
+        else:
+            print(f"[KimiAudio] forward: additional_information is None", flush=True)
+
+        # NEW: Check for pending audio tokens from serving_chat.py
+        if hasattr(self, "_pending_audio_tokens") and self._pending_audio_tokens is not None:
+            print(f"[KimiAudio] forward: Found {len(self._pending_audio_tokens)} pending audio tokens", flush=True)
+            self._current_audio_tokens = self._pending_audio_tokens
+            self._pending_audio_tokens = None  # Clear after use
+        else:
+            print(f"[KimiAudio] forward: No pending audio tokens", flush=True)
+
+        # NEW: Extract raw audio from additional_information and tokenize it
+        if additional_information is not None and self._current_audio_tokens is None:
+            try:
+                # Check for deferred_multi_modal_data
+                deferred_data = additional_information.get("deferred_multi_modal_data", {})
+                if deferred_data:
+                    print(f"[KimiAudio] forward: Found deferred_multi_modal_data with keys: {list(deferred_data.keys())}", flush=True)
+
+                    # Check if audio data is present
+                    audio_data_list = deferred_data.get("audio", [])
+                    if audio_data_list and len(audio_data_list) > 0:
+                        print(f"[KimiAudio] forward: Found {len(audio_data_list)} audio items in deferred data", flush=True)
+
+                        # Take the first audio item
+                        raw_audio = audio_data_list[0]
+                        print(f"[KimiAudio] forward: Raw audio type: {type(raw_audio)}", flush=True)
+
+                        # Tokenize the raw audio
+                        discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
+                        if discrete_tokens is not None:
+                            self._current_audio_tokens = discrete_tokens
+                            print(f"[KimiAudio] ✅ forward: Tokenized audio into {len(discrete_tokens)} discrete tokens", flush=True)
+                            print(f"[KimiAudio] First 5 tokens: {discrete_tokens[:5]}", flush=True)
+                        else:
+                            print(f"[KimiAudio] ⚠️ forward: Could not tokenize audio", flush=True)
+                    else:
+                        print(f"[KimiAudio] forward: No audio data in deferred_multi_modal_data", flush=True)
+                else:
+                    print(f"[KimiAudio] forward: No deferred_multi_modal_data in additional_information", flush=True)
+            except Exception as e:
+                print(f"[KimiAudio] ❌ ERROR extracting audio from additional_information: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+        # NEW: Replace BLANK tokens in input_ids with actual audio tokens
+        # This is critical: model expects discrete audio tokens, not BLANK tokens
+        if self._current_audio_tokens is not None and input_ids is not None:
+            try:
+                # Find positions where input_ids contains BLANK tokens
+                blank_mask = (input_ids == self._blank_token_id)
+                num_blank_positions = blank_mask.sum().item()
+
+                if num_blank_positions > 0:
+                    print(f"[KimiAudio] forward: Found {num_blank_positions} BLANK tokens in input_ids", flush=True)
+                    print(f"[KimiAudio] forward: Will replace with {len(self._current_audio_tokens)} discrete audio tokens", flush=True)
+
+                    # Check if we have the right number of audio tokens
+                    if len(self._current_audio_tokens) == num_blank_positions:
+                        # Replace BLANK tokens with actual audio tokens
+                        audio_tokens_tensor = torch.tensor(
+                            self._current_audio_tokens,
+                            dtype=input_ids.dtype,
+                            device=input_ids.device
+                        )
+                        input_ids = input_ids.clone()  # Don't modify original
+                        input_ids[blank_mask] = audio_tokens_tensor
+                        print(f"[KimiAudio] ✅ Replaced BLANK tokens with discrete audio tokens", flush=True)
+                        print(f"[KimiAudio] First 5 audio tokens: {self._current_audio_tokens[:5]}", flush=True)
+                    else:
+                        print(f"[KimiAudio] ⚠️ Mismatch: {num_blank_positions} BLANK positions but {len(self._current_audio_tokens)} audio tokens", flush=True)
+                        print(f"[KimiAudio] ⚠️ Will use BLANK tokens (may cause EOS)", flush=True)
+                else:
+                    print(f"[KimiAudio] forward: No BLANK tokens found in input_ids", flush=True)
+            except Exception as e:
+                print(f"[KimiAudio] ❌ ERROR replacing BLANK tokens: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
 
         # 1. Embed inputs (reuse upstream fusion)
         if inputs_embeds is not None:
@@ -431,9 +537,59 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> Optional[dict]:
         """Parse and validate audio input from kwargs."""
+        # DEBUG: Log all keys in kwargs
+        print(f"[KimiAudio] _parse_and_validate_audio_input: kwargs keys: {list(kwargs.keys())}", flush=True)
+
+        # Check if audio_tokens are available (from serving_chat.py)
+        audio_tokens = kwargs.get("audio_tokens", None)
+        if audio_tokens is not None:
+            print(f"[KimiAudio] ✅ audio_tokens found in kwargs! Length: {len(audio_tokens) if hasattr(audio_tokens, '__len__') else 'N/A'}", flush=True)
+            if isinstance(audio_tokens, (list, tuple)) and len(audio_tokens) > 0:
+                self._current_audio_tokens = list(audio_tokens)
+                print(f"[KimiAudio] ✅ Stored {len(self._current_audio_tokens)} audio tokens from kwargs", flush=True)
+                print(f"[KimiAudio] First 5 tokens: {self._current_audio_tokens[:5]}", flush=True)
+            else:
+                print(f"[KimiAudio] ⚠️ audio_tokens is empty or not a list", flush=True)
+        else:
+            print(f"[KimiAudio] No audio_tokens in kwargs", flush=True)
+
+        # Check if raw audio is available
+        raw_audio = kwargs.get("audio", None)
+        if raw_audio is not None:
+            print(f"[KimiAudio] ✅ Raw audio found in kwargs! Type: {type(raw_audio)}", flush=True)
+            # Tokenize the raw audio
+            discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
+            if discrete_tokens is not None:
+                self._current_audio_tokens = discrete_tokens
+                print(f"[KimiAudio] ✅ Tokenized audio into {len(discrete_tokens)} discrete tokens", flush=True)
+                print(f"[KimiAudio] First 5 tokens: {discrete_tokens[:5]}", flush=True)
+            else:
+                print(f"[KimiAudio] ⚠️ Could not tokenize audio", flush=True)
+        else:
+            print(f"[KimiAudio] No raw audio in kwargs", flush=True)
+
         # Look for audio features in kwargs
         whisper_features = kwargs.get("whisper_input_features", None)
         feature_attention_mask = kwargs.get("feature_attention_mask", None)
+
+        # DEBUG: Log what we receive from HF processor
+        if whisper_features is not None:
+            try:
+                print(f"\n=== DEBUG: _parse_and_validate_audio_input ===", flush=True)
+                print(f"whisper_features from HF processor:", flush=True)
+                print(f"  type: {type(whisper_features)}", flush=True)
+                if hasattr(whisper_features, 'shape'):
+                    print(f"  shape: {whisper_features.shape}", flush=True)
+                    print(f"  dtype: {whisper_features.dtype}", flush=True)
+                    print(f"  mean: {whisper_features.mean().item():.6f}", flush=True)
+                    print(f"  std: {whisper_features.std().item():.6f}", flush=True)
+                    print(f"  min: {whisper_features.min().item():.6f}", flush=True)
+                    print(f"  max: {whisper_features.max().item():.6f}", flush=True)
+                if feature_attention_mask is not None and hasattr(feature_attention_mask, 'shape'):
+                    print(f"feature_attention_mask: shape={feature_attention_mask.shape}, sum={feature_attention_mask.sum().item()}", flush=True)
+                print(f"=== END DEBUG ===\n", flush=True)
+            except Exception as e:
+                print(f"DEBUG ERROR: {e}", flush=True)
 
         # If whisper_features not provided, check for raw audio input
         if whisper_features is None:
@@ -442,11 +598,31 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 # Preprocess raw audio to extract Whisper features
                 whisper_features = self._extract_whisper_features(raw_audio)
                 if whisper_features is not None:
+                    # NEW: Also tokenize audio into discrete tokens
+                    discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
+                    if discrete_tokens is not None:
+                        self._current_audio_tokens = discrete_tokens
+                        print(f"[KimiAudio] ✅ Stored {len(discrete_tokens)} discrete audio tokens", flush=True)
+                    else:
+                        print(f"[KimiAudio] ⚠️ Could not tokenize audio, will use BLANK tokens", flush=True)
+                        self._current_audio_tokens = None
+
                     return {
                         "whisper_input_features": whisper_features,
                         "feature_attention_mask": None,
                     }
             return None
+
+        # If we have whisper_features but also raw audio, tokenize the audio
+        raw_audio = kwargs.get("audio", None)
+        if raw_audio is not None:
+            discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
+            if discrete_tokens is not None:
+                self._current_audio_tokens = discrete_tokens
+                print(f"[KimiAudio] ✅ Stored {len(discrete_tokens)} discrete audio tokens", flush=True)
+            else:
+                print(f"[KimiAudio] ⚠️ Could not tokenize audio, will use BLANK tokens", flush=True)
+                self._current_audio_tokens = None
 
         return {
             "whisper_input_features": whisper_features,
@@ -518,19 +694,104 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             traceback.print_exc()
             return None
 
+    def _tokenize_audio_to_discrete_tokens(self, raw_audio: Any) -> Optional[list[int]]:
+        """Tokenize audio into discrete tokens using Glm4Tokenizer.
+
+        Args:
+            raw_audio: Raw audio input (waveform tensor, numpy array, or file path)
+
+        Returns:
+            List of discrete audio token IDs, or None if tokenization fails
+        """
+        if self.audio_tokenizer is None:
+            print("[KimiAudio] ❌ Audio tokenizer not available, cannot tokenize audio", flush=True)
+            return None
+
+        try:
+            import numpy as np
+            import tempfile
+            import os
+
+            # Convert raw audio to file path if needed
+            if isinstance(raw_audio, (str, bytes)):
+                # Already a file path
+                audio_path = raw_audio
+            elif isinstance(raw_audio, np.ndarray):
+                # Save numpy array to temp file
+                wav_tensor = torch.from_numpy(raw_audio).float()
+                if wav_tensor.dim() == 1:
+                    wav_tensor = wav_tensor.unsqueeze(0)  # [T] -> [1, T]
+                # Save to temp file
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    temp_path = f.name
+                import torchaudio
+                torchaudio.save(temp_path, wav_tensor, 16000)
+                audio_path = temp_path
+            elif isinstance(raw_audio, torch.Tensor):
+                # Save tensor to temp file
+                if raw_audio.dim() == 1:
+                    raw_audio = raw_audio.unsqueeze(0)
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+                    temp_path = f.name
+                import torchaudio
+                torchaudio.save(temp_path, raw_audio.float(), 16000)
+                audio_path = temp_path
+            else:
+                print(f"[KimiAudio] ❌ Unsupported audio type: {type(raw_audio)}", flush=True)
+                return None
+
+            # Tokenize audio using Glm4Tokenizer
+            print(f"[KimiAudio] Tokenizing audio: {audio_path}", flush=True)
+            wav_tokens = self.audio_tokenizer.tokenize(audio_path=audio_path)
+
+            # Add offset to get actual token IDs
+            wav_tokens = wav_tokens + self._token_offset
+
+            # Convert to list
+            wav_tokens_list = wav_tokens.squeeze(0).cpu().numpy().tolist()
+
+            print(f"[KimiAudio] ✅ Tokenized audio into {len(wav_tokens_list)} discrete tokens", flush=True)
+            print(f"[KimiAudio] First 5 tokens: {wav_tokens_list[:5]}", flush=True)
+
+            # Clean up temp file if we created one
+            if isinstance(raw_audio, (np.ndarray, torch.Tensor)) and 'temp_path' in locals():
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+
+            return wav_tokens_list
+
+        except Exception as e:
+            print(f"[KimiAudio] ❌ ERROR: Failed to tokenize audio: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            return None
+
     def _process_audio_input(self, audio_input: dict) -> torch.Tensor:
         """Process audio input through Whisper encoder and VQAdaptor."""
         whisper_features = audio_input["whisper_input_features"]
 
+        print(f"\n=== DEBUG: _process_audio_input ===", flush=True)
+        print(f"Input whisper_features: shape={whisper_features.shape}, dtype={whisper_features.dtype}", flush=True)
+        print(f"  mean={whisper_features.mean().item():.6f}, std={whisper_features.std().item():.6f}", flush=True)
+
         # Run through Whisper encoder
         whisper_output = self.audio_tower(whisper_features)
+        print(f"After audio_tower (Whisper encoder): shape={whisper_output.shape}, dtype={whisper_output.dtype}", flush=True)
+        print(f"  mean={whisper_output.mean().item():.6f}, std={whisper_output.std().item():.6f}", flush=True)
 
-        # Project Whisper output to VQ adaptor input dimension if needed
+        # Project whisper output to VQ adaptor input dimension if needed
         if self.whisper_projection is not None:
             whisper_output = self.whisper_projection(whisper_output)
+            print(f"After whisper_projection: shape={whisper_output.shape}", flush=True)
+            print(f"  mean={whisper_output.mean().item():.6f}, std={whisper_output.std().item():.6f}", flush=True)
 
         # Run through VQAdaptor (multi_modal_projector)
         audio_embeds = self.multi_modal_projector(whisper_output)
+        print(f"After multi_modal_projector (VQAdaptor): shape={audio_embeds.shape}, dtype={audio_embeds.dtype}", flush=True)
+        print(f"  mean={audio_embeds.mean().item():.6f}, std={audio_embeds.std().item():.6f}", flush=True)
+        print(f"=== END DEBUG ===\n", flush=True)
 
         return audio_embeds
 
@@ -604,19 +865,52 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                             # Create output tensor starting with text embeddings
                             result_emb = text_emb.clone()
 
-                            # Place audio features at multimodal positions
+                            # Get multimodal positions
                             multimodal_positions = torch.where(is_multimodal)[0]
                             print(f"[KimiAudio] embed_input_ids: placing audio at positions {multimodal_positions.tolist()}", flush=True)
-                            result_emb[multimodal_positions] = audio_features
 
-                            # Apply √2 scaling to multimodal positions
-                            result_emb[multimodal_positions] = result_emb[multimodal_positions] * (2 ** 0.5)
+                            # REFERENCE IMPLEMENTATION FIX:
+                            # Reference implementation ADDS discrete token embeddings + continuous features, then scales
+                            # Reference code (modeling_moonshot_kimia.py):
+                            #   encoder_input_addwith_discrete_token = (audio_emb + whisper_emb) * sqrt(2)
+                            #   audio_emb = audio_emb * (~is_continuous_mask) + encoder_input_addwith_discrete_token * is_continuous_mask
+                            #
+                            # Previous vllm-omni was REPLACING text_emb with audio_features (WRONG)
+                            # Fixed version: ADD text_emb + audio_features, then scale by sqrt(2)
+
+                            # Debug: Check values before fusion
+                            discrete_emb = result_emb[multimodal_positions]
+                            try:
+                                print(f"[KimiAudio] embed_input_ids DEBUG:", flush=True)
+                                print(f"  discrete_emb (BLANK tokens): mean={discrete_emb.mean().item():.6f}, std={discrete_emb.std().item():.6f}, min={discrete_emb.min().item():.6f}, max={discrete_emb.max().item():.6f}", flush=True)
+                                print(f"  audio_features (continuous): mean={audio_features.mean().item():.6f}, std={audio_features.std().item():.6f}, min={audio_features.min().item():.6f}, max={audio_features.max().item():.6f}", flush=True)
+                            except Exception as e:
+                                print(f"[KimiAudio] embed_input_ids DEBUG: Error logging stats: {e}", flush=True)
+
+                            # Add discrete token embeddings (BLANK tokens) with continuous features
+                            combined_emb = discrete_emb + audio_features
+
+                            try:
+                                print(f"  combined_emb (before √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}", flush=True)
+                            except:
+                                pass
+
+                            # Scale by sqrt(2)
+                            combined_emb = combined_emb * (2 ** 0.5)
+
+                            try:
+                                print(f"  combined_emb (after √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}", flush=True)
+                            except:
+                                pass
+
+                            # Place back
+                            result_emb[multimodal_positions] = combined_emb
 
                             text_emb = result_emb
-                            print(f"[KimiAudio] embed_input_ids: ✅ Audio features placed successfully", flush=True)
+                            print(f"[KimiAudio] embed_input_ids: ✅ Audio features ADDED to discrete tokens and scaled by √2", flush=True)
                         else:
                             print(f"[KimiAudio] embed_input_ids: ❌ Shape mismatch! audio_features.shape[0]={audio_features.shape[0]} != num_audio_positions={num_audio_positions}", flush=True)
-                            # Fallback: shapes don't match, use original logic with broadcasting
+                            # Fallback: shapes don't match, apply additive fusion
                             whisper_emb = multimodal_embeddings.squeeze(0)
                             scaled_emb = (text_emb + whisper_emb) * (2 ** 0.5)
                             text_emb = torch.where(
