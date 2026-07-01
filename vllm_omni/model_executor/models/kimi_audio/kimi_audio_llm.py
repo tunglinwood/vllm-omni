@@ -313,6 +313,21 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Store audio tokens for current request (will be set in _parse_and_validate_audio_input)
         self._current_audio_tokens: Optional[list[int]] = None
 
+    def _log_tensor_stats(self, name: str, tensor: torch.Tensor) -> None:
+        """Log tensor statistics (only in eager mode, not during CUDA graph capture).
+
+        Args:
+            name: Label for the tensor (e.g., "After layer 21")
+            tensor: Tensor to log statistics for
+        """
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                mean_val = tensor.mean().item()
+                std_val = tensor.std().item()
+                logger.debug("%s: mean=%.4f, std=%.4f", name, mean_val, std_val)
+            except Exception as e:
+                logger.debug("%s: error logging stats: %s", name, e)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -385,27 +400,41 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         if self._current_audio_tokens is not None and input_ids is not None:
             try:
                 blank_mask = (input_ids == self._blank_token_id)
-                num_blank_positions = blank_mask.sum().item()
-                logger.info("forward: Found %d BLANK tokens (id=%d) in input_ids", num_blank_positions, self._blank_token_id)
-                logger.info("forward: Have %d audio tokens to insert", len(self._current_audio_tokens))
+                num_blank_positions = blank_mask.sum()  # Keep as tensor, no .item()
 
-                if num_blank_positions > 0:
-                    if len(self._current_audio_tokens) == num_blank_positions:
-                        audio_tokens_tensor = torch.tensor(
-                            self._current_audio_tokens,
-                            dtype=input_ids.dtype,
-                            device=input_ids.device
-                        )
-                        input_ids = input_ids.clone()
-                        input_ids[blank_mask] = audio_tokens_tensor
-                        logger.info("✅ Replaced %d BLANK tokens with %d audio tokens", num_blank_positions, len(self._current_audio_tokens))
+                # Guard logging with CUDA graph capture detection
+                if not torch.cuda.is_current_stream_capturing():
+                    logger.info("forward: Found %d BLANK tokens (id=%d) in input_ids", num_blank_positions.item(), self._blank_token_id)
+                    logger.info("forward: Have %d audio tokens to insert", len(self._current_audio_tokens))
+
+                if self._current_audio_tokens:  # Non-empty check (Python-level, OK)
+                    audio_tokens_tensor = torch.tensor(
+                        self._current_audio_tokens,
+                        dtype=input_ids.dtype,
+                        device=input_ids.device
+                    )
+                    # CUDA graph compatibility: compare Python int with tensor
+                    # During capture, this comparison is evaluated at trace time
+                    # In eager mode, it's evaluated each time
+                    num_blank_int = num_blank_positions.item() if not torch.cuda.is_current_stream_capturing() else audio_tokens_tensor.shape[0]
+
+                    if audio_tokens_tensor.shape[0] == num_blank_int:
+                        # Use torch.where instead of masked assignment for CUDA graph compatibility
+                        input_ids = torch.where(blank_mask, audio_tokens_tensor, input_ids)
+                        if not torch.cuda.is_current_stream_capturing():
+                            logger.info("✅ Replaced %d BLANK tokens with %d audio tokens",
+                                       num_blank_int, len(self._current_audio_tokens))
                     else:
-                        logger.error("❌ MISMATCH: %d BLANK positions but %d audio tokens - cannot replace!",
-                                       num_blank_positions, len(self._current_audio_tokens))
+                        # Shape mismatch - only log in eager mode
+                        if not torch.cuda.is_current_stream_capturing():
+                            logger.error("❌ MISMATCH: %d BLANK positions but %d audio tokens - cannot replace!",
+                                       num_blank_int, len(self._current_audio_tokens))
                 else:
-                    logger.error("❌ No BLANK tokens found in input_ids - audio will not be processed!")
+                    if not torch.cuda.is_current_stream_capturing():
+                        logger.error("❌ No audio tokens available - audio will not be processed!")
             except Exception as e:
-                logger.error("❌ ERROR replacing BLANK tokens: %s", e, exc_info=True)
+                if not torch.cuda.is_current_stream_capturing():
+                    logger.error("❌ ERROR replacing BLANK tokens: %s", e, exc_info=True)
 
         # 1. Embed inputs (reuse upstream fusion)
         if inputs_embeds is not None:
@@ -417,16 +446,17 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         # 2. Forward through layers 0-21 (first 22 layers)
         hidden_states, residual = self._forward_to_layer_21(input_ids, positions, inputs_embeds_fused)
 
-        # Debug logging (safe formatting)
-        try:
-            hidden_mean = hidden_states.mean().item() if not torch.isnan(hidden_states.mean()) else float('nan')
-            hidden_std = hidden_states.std().item() if not torch.isnan(hidden_states.std()) else float('nan')
-            logger.debug("After layer 21: shape=%s, residual=%s, mean=%.4f, std=%.4f",
-                         hidden_states.shape,
-                         None if residual is None else residual.shape,
-                         hidden_mean, hidden_std)
-        except Exception as e:
-            logger.debug("After layer 21: shape=%s (debug error: %s)", hidden_states.shape, e)
+        # Debug logging (CUDA graph compatible)
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                hidden_mean = hidden_states.mean().item() if not torch.isnan(hidden_states.mean()) else float('nan')
+                hidden_std = hidden_states.std().item() if not torch.isnan(hidden_states.std()) else float('nan')
+                logger.debug("After layer 21: shape=%s, residual=%s, mean=%.4f, std=%.4f",
+                             hidden_states.shape,
+                             None if residual is None else residual.shape,
+                             hidden_mean, hidden_std)
+            except Exception as e:
+                logger.debug("After layer 21: shape=%s (debug error: %s)", hidden_states.shape, e)
 
         # 3. Bifurcation: clone hidden states AFTER layer 21
         # Reference: modeling_moonshot_kimia.py line 788-789
@@ -443,13 +473,15 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Apply final norm (takes both hidden_states and residual in vLLM)
         text_hidden_states, _ = self.model.model.norm(text_hidden_states, text_residual)
 
-        try:
-            logger.debug("Text path: shape=%s, mean=%.4f, std=%.4f",
-                         text_hidden_states.shape,
-                         text_hidden_states.mean().item(),
-                         text_hidden_states.std().item())
-        except Exception:
-            logger.debug("Text path: shape=%s", text_hidden_states.shape)
+        # Debug logging (CUDA graph compatible)
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                logger.debug("Text path: shape=%s, mean=%.4f, std=%.4f",
+                             text_hidden_states.shape,
+                             text_hidden_states.mean().item(),
+                             text_hidden_states.std().item())
+            except Exception:
+                logger.debug("Text path: shape=%s", text_hidden_states.shape)
 
         # 5. Audio path: 6 MIMO layers → mimo_output
         # Audio path starts from layer 21 output (already in audio_hidden_states)
@@ -466,17 +498,19 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         else:
             audio_logits = audio_logits_output
 
-        try:
-            logger.debug("Audio path: shape=%s, logits=%s, mean=%.4f, std=%.4f",
-                         audio_hidden_states.shape, audio_logits.shape,
-                         audio_hidden_states.mean().item(),
-                         audio_hidden_states.std().item())
-        except Exception:
-            logger.debug("Audio path: shape=%s, logits=%s",
-                         audio_hidden_states.shape, audio_logits.shape)
+        # Debug logging (CUDA graph compatible)
+        if not torch.cuda.is_current_stream_capturing():
+            try:
+                logger.debug("Audio path: shape=%s, logits=%s, mean=%.4f, std=%.4f",
+                             audio_hidden_states.shape, audio_logits.shape,
+                             audio_hidden_states.mean().item(),
+                             audio_hidden_states.std().item())
+            except Exception:
+                logger.debug("Audio path: shape=%s, logits=%s",
+                             audio_hidden_states.shape, audio_logits.shape)
 
-        # Debug: Log top 5 audio logits
-        if audio_logits.shape[0] > 0:
+        # Debug: Log top 5 audio logits (CUDA graph compatible)
+        if not torch.cuda.is_current_stream_capturing() and audio_logits.shape[0] > 0:
             top5_audio = torch.topk(audio_logits[0], 5)
             logger.debug("Audio path: top5 token_ids=%s, logits=%s",
                          top5_audio.indices.tolist(), top5_audio.values.tolist())
@@ -852,7 +886,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 logger.debug("multimodal_embeddings shape: %s", multimodal_embeddings.shape)
             if is_multimodal is not None:
                 logger.debug("is_multimodal shape: %s", is_multimodal.shape)
-                logger.debug("is_multimodal sum: %s", is_multimodal.sum().item())
+                # CUDA graph compatible logging
+                if not torch.cuda.is_current_stream_capturing():
+                    logger.debug("is_multimodal sum: %s", is_multimodal.sum().item())
             
             # Ensure multimodal_embeddings is a tensor (not a list)
             if isinstance(multimodal_embeddings, list):
@@ -876,12 +912,19 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                     # For now, assume single audio item (most common case)
                     if multimodal_embeddings.shape[0] == 1:
                         audio_features = multimodal_embeddings[0]  # [audio_seq_len, hidden_size]
-                        num_audio_positions = is_multimodal.sum().item()
+                        # CUDA graph compatible: keep as tensor
+                        num_audio_positions = is_multimodal.sum()
 
-                        logger.debug("embed_input_ids: audio_features shape=%s, num_audio_positions=%s", audio_features.shape, num_audio_positions)
+                        # CUDA graph compatible: convert to int for comparison
+                        # During capture, use shape[0] to avoid data-dependent conditional
+                        num_audio_int = num_audio_positions.item() if not torch.cuda.is_current_stream_capturing() else audio_features.shape[0]
+
+                        # CUDA graph compatible logging
+                        if not torch.cuda.is_current_stream_capturing():
+                            logger.debug("embed_input_ids: audio_features shape=%s, num_audio_positions=%s", audio_features.shape, num_audio_int)
 
                         # Check if audio features match the number of multimodal positions
-                        if audio_features.shape[0] == num_audio_positions:
+                        if audio_features.shape[0] == num_audio_int:
                             # Create output tensor starting with text embeddings
                             result_emb = text_emb.clone()
 
@@ -900,28 +943,34 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                             # Debug: Check values before fusion
                             discrete_emb = result_emb[multimodal_positions]
-                            try:
-                                logger.debug("embed_input_ids DEBUG:")
-                                logger.debug("  discrete_emb (BLANK tokens): mean={discrete_emb.mean().item():.6f}, std={discrete_emb.std().item():.6f}, min={discrete_emb.min().item():.6f}, max={discrete_emb.max().item():.6f}")
-                                logger.debug("  audio_features (continuous): mean={audio_features.mean().item():.6f}, std={audio_features.std().item():.6f}, min={audio_features.min().item():.6f}, max={audio_features.max().item():.6f}")
-                            except Exception as e:
-                                logger.debug("embed_input_ids DEBUG: Error logging stats: %s", e)
+                            # CUDA graph compatible logging
+                            if not torch.cuda.is_current_stream_capturing():
+                                try:
+                                    logger.debug("embed_input_ids DEBUG:")
+                                    logger.debug("  discrete_emb (BLANK tokens): mean={discrete_emb.mean().item():.6f}, std={discrete_emb.std().item():.6f}, min={discrete_emb.min().item():.6f}, max={discrete_emb.max().item():.6f}")
+                                    logger.debug("  audio_features (continuous): mean={audio_features.mean().item():.6f}, std={audio_features.std().item():.6f}, min={audio_features.min().item():.6f}, max={audio_features.max().item():.6f}")
+                                except Exception as e:
+                                    logger.debug("embed_input_ids DEBUG: Error logging stats: %s", e)
 
                             # Add discrete token embeddings (BLANK tokens) with continuous features
                             combined_emb = discrete_emb + audio_features
 
-                            try:
-                                logger.debug("  combined_emb (before √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}")
-                            except Exception:
-                                pass
+                            # CUDA graph compatible logging
+                            if not torch.cuda.is_current_stream_capturing():
+                                try:
+                                    logger.debug("  combined_emb (before √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}")
+                                except Exception:
+                                    pass
 
                             # Scale by sqrt(2)
                             combined_emb = combined_emb * (2 ** 0.5)
 
-                            try:
-                                logger.debug("  combined_emb (after √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}")
-                            except Exception:
-                                pass
+                            # CUDA graph compatible logging
+                            if not torch.cuda.is_current_stream_capturing():
+                                try:
+                                    logger.debug("  combined_emb (after √2): mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}")
+                                except Exception:
+                                    pass
 
                             # Place back
                             result_emb[multimodal_positions] = combined_emb
@@ -986,13 +1035,12 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                 # Get the LAST audio token for this request (from previous generation step)
                 last_audio_token = audio_out_ids[:, -1:]  # [1, 1]
-                last_audio_token_id = last_audio_token.item()
-
-                # Clamp to valid range
-                last_audio_token_id = max(0, min(last_audio_token_id, embed_weight.shape[0] - 1))
+                # CUDA graph compatible: keep as tensor, use torch.clamp
+                last_audio_token_id = last_audio_token.squeeze()  # [1] tensor
+                last_audio_token_id = torch.clamp(last_audio_token_id, 0, embed_weight.shape[0] - 1)
 
                 # Embed the audio token and ADD to text embedding (dual stream fusion)
-                audio_emb = embed_weight[last_audio_token_id]  # [hidden_dim]
+                audio_emb = embed_weight[last_audio_token_id]  # Indexing with tensor is OK
                 inputs_embeds[pos] = inputs_embeds[pos] + audio_emb.to(dtype=inputs_embeds.dtype)
                 audio_tokens_added += 1
 
@@ -1100,18 +1148,20 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
             # Get the sampled text token for this request
             if text_tokens.numel() > batch_i:
-                text_token_id = text_tokens[batch_i].item()
+                # CUDA graph compatible: keep as tensor
+                text_token_id = text_tokens[batch_i]
             else:
                 continue  # Skip if no token for this request
 
             # Handle text stream termination (reference: kimia.py line 134-139)
             if text_finished:
                 # Text stream already finished, replace token with BLANK
-                text_token_id = self._blank_token_id
+                text_token_id = torch.tensor(self._blank_token_id, device=text_tokens.device, dtype=text_tokens.dtype)
                 text_tokens[batch_i] = self._blank_token_id
                 logger.debug("Text stream finished, replacing token with BLANK")
             elif text_token_id == self._text_eos_id:
                 # Text stream just finished, mark it and keep the EOS token
+                # PyTorch can compare tensor == int directly
                 self._text_stream_finished[batch_i] = True
                 logger.debug("Text stream just finished (EOS token detected)")
             # else: text stream still active, keep the sampled token
@@ -1126,7 +1176,8 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                 # Sample from audio logits using argmax (greedy for now)
                 audio_logits_filtered = audio_logits[batch_i:batch_i+1, self._token_offset:]  # [1, 16384]
                 audio_token_idx = torch.argmax(audio_logits_filtered, dim=-1, keepdim=True)  # [1, 1]
-                audio_token_id = audio_token_idx.item() + self._token_offset
+                # CUDA graph compatible: tensor + int = tensor
+                audio_token_id = audio_token_idx + self._token_offset
 
             # 5. Append to cumulative audio history for this slot
             audio_token = torch.tensor([[audio_token_id]], device=logits.device)
