@@ -5,7 +5,7 @@ const proc = spawn('vllm-omni', [
   '/data1/moonshotai/Kimi-Audio-7B-Instruct',
   '--omni',
   '--port', '8091',
-  '--deploy-config', 'vllm_omni/deploy/kimi_audio.yaml',
+  '--deploy-config', 'vllm_omni/deploy/kimi_audio_cuda_graph.yaml',
   '--trust-remote-code'
 ], {
   cwd: __dirname,
