@@ -78,7 +78,8 @@ class KimiAudioDiT(nn.Module):
         """Sinusoidal time embedding."""
         dim = self.hidden_size
         half_dim = dim // 2
-        emb = torch.log(torch.tensor(10000.0, device=device)) / (half_dim - 1)
+        # CUDA graph compatible: use torch.full instead of torch.tensor
+        emb = torch.log(torch.full((1,), 10000.0, device=device, dtype=torch.float32)) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
         emb = t * emb
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
