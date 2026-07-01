@@ -25,40 +25,34 @@ def llm2detokenizer_async_chunk(
     request: Any,
     is_finished: bool,
 ) -> OmniPayloadStruct | None:
-    """Convert LLM audio logits to detokenizer input (async chunk streaming).
+    """Convert LLM audio tokens to detokenizer input (async chunk streaming).
 
     This function is called by the SharedMemoryConnector to transfer audio tokens
     from Stage 0 (LLM) to Stage 1 (detokenizer).
 
     Args:
         transfer_manager: Manages state across chunks (accumulated tokens per request)
-        multimodal_output: Dict with "audio_logits" key from Stage 0
+        multimodal_output: Dict with "audio_tokens" key from Stage 0 (sampled token IDs)
         request: Current request object
         is_finished: Whether this is the final chunk
 
     Returns:
         OmniPayloadStruct with audio tokens, or None if not ready to send
     """
-    # Extract audio logits from multimodal_output
-    audio_logits = multimodal_output.get("audio_logits")  # [B, vocab_size] or [B, L, vocab_size]
-    if audio_logits is None:
+    # Extract audio tokens from multimodal_output (already sampled token IDs)
+    audio_token_ids = multimodal_output.get("audio_tokens")  # [B, 1] or [B]
+    if audio_token_ids is None:
+        logger.warning("No audio_tokens in multimodal_output, keys: %s", list(multimodal_output.keys()))
         return None
 
-    # Debug: Print audio logit stats before filtering
-    print(f"[KimiAudio Stage Transfer] Before filtering: audio_logits shape={audio_logits.shape}, "
-          f"mean={audio_logits.mean():.4f}, std={audio_logits.std():.4f}, max={audio_logits.max():.4f}")
+    # Debug: Print audio token stats
+    logger.info(f"[KimiAudio Stage Transfer] Received audio_tokens: shape={audio_token_ids.shape}, "
+                f"min={audio_token_ids.min()}, max={audio_token_ids.max()}, mean={audio_token_ids.float().mean():.2f}")
 
-    # Handle both 2D [B, vocab_size] and 3D [B, L, vocab_size] shapes
-    if audio_logits.dim() == 2:
-        # [B, vocab_size] -> [B, 1, vocab_size]
-        audio_logits = audio_logits.unsqueeze(1)
-
-    # Argmax to get audio token IDs
-    audio_token_ids = torch.argmax(audio_logits, dim=-1)  # [B, L]
-
-    # Debug: Print what token IDs argmax selected
-    print(f"[KimiAudio Stage Transfer] After argmax: audio_token_ids shape={audio_token_ids.shape}, "
-          f"min={audio_token_ids.min()}, max={audio_token_ids.max()}, mean={audio_token_ids.float().mean():.2f}")
+    # Handle both 1D [B] and 2D [B, 1] shapes
+    if audio_token_ids.dim() == 1:
+        # [B] -> [B, 1]
+        audio_token_ids = audio_token_ids.unsqueeze(1)
 
     # CRITICAL: Filter audio tokens by kimia_token_offset (152064)
     # Kimi Audio uses a unified vocabulary where:
@@ -70,7 +64,7 @@ def llm2detokenizer_async_chunk(
     # Filter to keep only audio tokens (>= offset)
     audio_mask = audio_token_ids >= kimia_token_offset
     num_audio_tokens = audio_mask.sum().item()
-    print(f"[KimiAudio Stage Transfer] Audio token filtering: {num_audio_tokens} tokens >= {kimia_token_offset}")
+    logger.info(f"[KimiAudio Stage Transfer] Audio token filtering: {num_audio_tokens} tokens >= {kimia_token_offset}")
 
     audio_token_ids = audio_token_ids[audio_mask]  # Flatten to 1D
 
@@ -79,11 +73,11 @@ def llm2detokenizer_async_chunk(
         audio_token_ids = audio_token_ids - kimia_token_offset
         # Reshape to [1, L] for compatibility
         audio_token_ids = audio_token_ids.unsqueeze(0)
-        print(f"[KimiAudio Stage Transfer] After filtering: {audio_token_ids.shape}, min={audio_token_ids.min()}, max={audio_token_ids.max()}")
+        logger.info(f"[KimiAudio Stage Transfer] After filtering: {audio_token_ids.shape}, min={audio_token_ids.min()}, max={audio_token_ids.max()}")
     else:
         # No valid audio tokens - return empty tensor
         audio_token_ids = torch.zeros((1, 0), dtype=audio_token_ids.dtype, device=audio_token_ids.device)
-        print(f"[KimiAudio Stage Transfer] No audio tokens found! All tokens were in text range.")
+        logger.warning(f"[KimiAudio Stage Transfer] No audio tokens found! All tokens were in text range.")
 
     # Important: Only keep the last token's IDs (for generation, not prefill)
     # During prefill, B can be > 1 (one for each prompt token)
@@ -104,11 +98,9 @@ def llm2detokenizer_async_chunk(
     transfer_manager.audio_tokens[request_id].append(audio_token_ids)
 
     # Debug: log shapes
-    print(f"[KimiAudio Stage Transfer] Request {request_id}: "
-          f"audio_token_ids shape={audio_token_ids.shape}, "
-          f"num_accumulated={len(transfer_manager.audio_tokens[request_id])}")
-    for i, t in enumerate(transfer_manager.audio_tokens[request_id]):
-        print(f"[KimiAudio Stage Transfer]   Tensor {i}: shape={t.shape}")
+    logger.info(f"[KimiAudio Stage Transfer] Request {request_id}: "
+                f"audio_token_ids shape={audio_token_ids.shape}, "
+                f"num_accumulated={len(transfer_manager.audio_tokens[request_id])}")
 
     # Chunk gating: send when we have enough tokens or finished
     accumulated = torch.cat(transfer_manager.audio_tokens[request_id], dim=1)
@@ -171,22 +163,18 @@ def llm2detokenizer_token_only(
     """Extract audio token IDs only (for sync process_input).
 
     Args:
-        multimodal_output: Dict with "audio_logits" key from Stage 0
+        multimodal_output: Dict with "audio_tokens" key from Stage 0
 
     Returns:
         Audio token IDs tensor, or None
     """
-    audio_logits = multimodal_output.get("audio_logits")
-    if audio_logits is None:
+    audio_token_ids = multimodal_output.get("audio_tokens")
+    if audio_token_ids is None:
         return None
 
-    # Handle both 2D [B, vocab_size] and 3D [B, L, vocab_size] shapes
-    if audio_logits.dim() == 2:
-        # [B, vocab_size] -> [B, 1, vocab_size]
-        audio_logits = audio_logits.unsqueeze(1)
-
-    # Argmax to get audio token IDs
-    audio_token_ids = torch.argmax(audio_logits, dim=-1)  # [B, L]
+    # Handle both 1D [B] and 2D [B, 1] shapes
+    if audio_token_ids.dim() == 1:
+        audio_token_ids = audio_token_ids.unsqueeze(1)
 
     # CRITICAL: Filter audio tokens by kimia_token_offset (152064)
     # Kimi Audio uses a unified vocabulary where:
@@ -221,11 +209,11 @@ def llm2detokenizer_full_payload(
     request: Any,
     is_finished: bool,
 ) -> OmniPayloadStruct | None:
-    """Convert LLM audio logits to full detokenizer payload (for next_stage_input).
+    """Convert LLM audio tokens to full detokenizer payload (for next_stage_input).
 
     Args:
         transfer_manager: Manages state across chunks
-        multimodal_output: Dict with "audio_logits" key from Stage 0
+        multimodal_output: Dict with "audio_tokens" key from Stage 0
         request: Current request object
         is_finished: Whether this is the final chunk
 

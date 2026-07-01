@@ -41,7 +41,7 @@ stages:
   - stage_id: 1
     max_num_seqs: 1
     gpu_memory_utilization: 0.85
-    enforce_eager: false  # ← ENABLE CUDA GRAPHS
+    enforce_eager: true  # ← DISABLE CUDA GRAPHS (150-step ODE loop not capturable)
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false

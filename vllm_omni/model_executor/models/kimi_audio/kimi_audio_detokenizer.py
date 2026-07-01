@@ -361,6 +361,18 @@ class KimiAudioDetokenizerForConditionalGeneration(nn.Module):
         Returns:
             OmniOutput with waveform
         """
+        # DEBUG: Log when forward is called
+        import torch
+        logger = None
+        try:
+            from vllm.logger import init_logger
+            logger = init_logger(__name__)
+            logger.info(f"[DETOKENIZER] forward() called with input_ids shape: {input_ids.shape if input_ids is not None else None}")
+            if input_ids is not None:
+                logger.info(f"[DETOKENIZER] input_ids range: min={input_ids.min().item()}, max={input_ids.max().item()}")
+        except:
+            pass
+
         # 1. Flow-matching inference (150 ODE steps, CFG=4.0)
         mel_spectrogram = self.dit.generate(
             input_ids,
@@ -369,19 +381,29 @@ class KimiAudioDetokenizerForConditionalGeneration(nn.Module):
             dtype=self.dtype,
         )
 
+        if logger:
+            logger.info(f"[DETOKENIZER] mel_spectrogram shape: {mel_spectrogram.shape}")
+
         # 2. Vocoder: mel → waveform
         waveform = self.vocoder(mel_spectrogram)
 
+        if logger:
+            logger.info(f"[DETOKENIZER] waveform shape: {waveform.shape}")
+
         # 3. Return waveform in multimodal_outputs for proper audio extraction
-        # Use "model_outputs" key to match MiMo Audio pattern
+        # Use "audio" key to match serving code expectations
         # Reshape to (1, -1) for consistency
         waveform_flat = waveform.reshape(1, -1) if waveform is not None else waveform
+
+        if logger:
+            logger.info(f"[DETOKENIZER] Returning OmniOutput with audio key, waveform_flat shape: {waveform_flat.shape if waveform_flat is not None else None}")
+
         # Return sample rate as scalar to avoid accumulation issues
         sr_value = 24000
         return OmniOutput(
             text_hidden_states=None,
             multimodal_outputs={
-                "model_outputs": waveform_flat,
+                "audio": waveform_flat,  # Use "audio" key to match serving code expectations
                 "sr": sr_value,  # Return as scalar int, not tensor
             },
         )
