@@ -3,6 +3,7 @@
 
 from typing import Any, Optional
 
+import time
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
@@ -293,7 +294,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Special tokens (from tokenizer)
         self._audio_delay: int = 6  # First 6 audio tokens are BLANK
         self._blank_token_id: int = 151666  # <|im_kimia_text_blank|>
-        self._text_eos_id: int = 151667  # <|im_kimia_text_eos|>
+        # Use [EOS] token (151644) which is in model config's eos_token_ids
+        # This ensures the engine recognizes it as a stop signal
+        self._text_eos_id: int = 151644  # [EOS] from config's eos_token_ids
         self._token_offset: int = 152064  # Audio tokens start here
 
         # Audio tokenizer for discrete audio tokens
@@ -344,6 +347,13 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
     ) -> OmniOutput:
         """Forward pass with bifurcation at layer 21."""
 
+        # Log what we receive
+        with open("/tmp/kimi_audio_forward_debug.log", "a") as f:
+            f.write(f"[forward] === FORWARD CALL ===\n")
+            f.write(f"[forward] input_ids shape: {input_ids.shape if input_ids is not None else None}\n")
+            f.write(f"[forward] multimodal_embeddings shape: {multimodal_embeddings.shape if multimodal_embeddings is not None else None}\n")
+            f.write(f"[forward] inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}\n")
+
         # Check both additional_information and runtime_additional_information
         # runtime_additional_information is a list (one per request in batch)
         # We need to extract the first element for single-request batch
@@ -360,29 +370,43 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
                      len(runtime_additional_information) if runtime_additional_information else None)
 
         # Extract raw audio from additional_information and tokenize it
-        logger.info("forward: effective_additional_info keys: %s",
+        logger.warning("forward: effective_additional_info keys: %s",
                      list(effective_additional_info.keys()) if effective_additional_info else None)
-        logger.info("forward: _current_audio_tokens is None: %s", self._current_audio_tokens is None)
+        logger.warning("forward: _current_audio_tokens is None: %s", self._current_audio_tokens is None)
 
         if effective_additional_info is not None and self._current_audio_tokens is None:
             try:
                 deferred_data = effective_additional_info.get("deferred_multi_modal_data", {})
                 logger.info("forward: deferred_data keys: %s", list(deferred_data.keys()) if deferred_data else None)
                 if deferred_data:
-                    audio_data_list = deferred_data.get("audio", [])
-                    logger.info("forward: audio_data_list length: %d", len(audio_data_list) if audio_data_list else 0)
-                    if audio_data_list and len(audio_data_list) > 0:
-                        raw_audio = audio_data_list[0]
-                        logger.info("forward: Raw audio type: %s, size: %s", type(raw_audio),
-                                   len(raw_audio) if hasattr(raw_audio, '__len__') else 'N/A')
-                        logger.info("forward: Raw audio content: %s", str(raw_audio)[:500])
+                    audio_data = deferred_data.get("audios", None)
+                    logger.warning("forward: audio_data type: %s", type(audio_data))
+                    if audio_data is not None:
+                        # Audio data can be a single tensor or a list of tensors
+                        if isinstance(audio_data, torch.Tensor):
+                            # Single stacked tensor - take the first item
+                            if audio_data.dim() == 3:
+                                # Shape: [batch, channels, samples] - take first batch item
+                                raw_audio = audio_data[0]
+                            elif audio_data.dim() == 2:
+                                # Shape: [channels, samples] - use as-is
+                                raw_audio = audio_data
+                            else:
+                                raw_audio = audio_data
+                            logger.warning("forward: Raw audio from tensor, shape: %s", raw_audio.shape)
+                        elif isinstance(audio_data, list) and len(audio_data) > 0:
+                            raw_audio = audio_data[0]
+                            logger.warning("forward: Raw audio from list, type: %s", type(raw_audio))
+                        else:
+                            raw_audio = audio_data
+                            logger.warning("forward: Raw audio, type: %s", type(raw_audio))
 
                         discrete_tokens = self._tokenize_audio_to_discrete_tokens(raw_audio)
                         if discrete_tokens is not None:
                             self._current_audio_tokens = discrete_tokens
-                            logger.info("✅ forward: Tokenized audio into %d discrete tokens", len(discrete_tokens))
-                            logger.info("   First 5 tokens: %s", discrete_tokens[:5])
-                            logger.info("   Last 5 tokens: %s", discrete_tokens[-5:])
+                            logger.warning("✅ forward: Tokenized audio into %d discrete tokens", len(discrete_tokens))
+                            logger.warning("   First 5 tokens: %s", discrete_tokens[:5])
+                            logger.warning("   Last 5 tokens: %s", discrete_tokens[-5:])
                         else:
                             logger.error("❌ forward: Could not tokenize audio")
                     else:
@@ -440,8 +464,13 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         if inputs_embeds is not None:
             # Use provided embeddings if available
             inputs_embeds_fused = inputs_embeds
+            with open("/tmp/kimi_audio_forward_debug.log", "a") as f:
+                f.write(f"[forward] Using provided inputs_embeds, shape={inputs_embeds.shape}\n")
         else:
             inputs_embeds_fused = self.embed_input_ids(input_ids, multimodal_embeddings)
+            with open("/tmp/kimi_audio_forward_debug.log", "a") as f:
+                f.write(f"[forward] Called embed_input_ids, result shape={inputs_embeds_fused.shape}\n")
+                f.write(f"[forward] inputs_embeds_fused mean={inputs_embeds_fused.mean().item():.6f}, std={inputs_embeds_fused.std().item():.6f}\n")
 
         # 2. Forward through layers 0-21 (first 22 layers)
         hidden_states, residual = self._forward_to_layer_21(input_ids, positions, inputs_embeds_fused)
@@ -553,6 +582,10 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         This method is called by vLLM's multimodal processing pipeline.
         It processes audio inputs through the Whisper encoder and VQAdaptor.
         """
+        with open("/tmp/kimi_audio_debug.log", "a") as f:
+            f.write(f"[{time.time()}] embed_multimodal called with kwargs keys: {list(kwargs.keys())}\n")
+            f.flush()
+        print(f"[DEBUG] embed_multimodal called with keys: {list(kwargs.keys())}", flush=True)
         # Parse audio input from kwargs
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
@@ -892,6 +925,16 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             
             # Ensure multimodal_embeddings is a tensor (not a list)
             if isinstance(multimodal_embeddings, list):
+                # DEBUG: Log before filtering
+                logger.warning("BEFORE FILTER: multimodal_embeddings has %d items", len(multimodal_embeddings))
+                for i, item in enumerate(multimodal_embeddings):
+                    if item is None:
+                        logger.warning("  Item %d: None", i)
+                    elif isinstance(item, torch.Tensor):
+                        logger.warning("  Item %d: Tensor shape=%s", i, item.shape)
+                    else:
+                        logger.warning("  Item %d: type=%s", i, type(item))
+
                 # Filter out None items and check if list is empty
                 multimodal_embeddings = [item for item in multimodal_embeddings if item is not None and isinstance(item, torch.Tensor)]
                 if len(multimodal_embeddings) == 0:
@@ -904,6 +947,12 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
             # Only process multimodal embeddings if we have valid tensors
             if multimodal_embeddings is not None:
+                with open("/tmp/kimi_audio_embed_debug.log", "a") as f:
+                    f.write(f"[embed_input_ids] ✅ multimodal_embeddings is not None, shape={multimodal_embeddings.shape}\n")
+                    f.write(f"[embed_input_ids] is_multimodal is not None: {is_multimodal is not None}\n")
+                    if is_multimodal is not None:
+                        f.write(f"[embed_input_ids] is_multimodal sum: {is_multimodal.sum().item()}\n")
+
                 if is_multimodal is not None:
                     # is_multimodal marks which positions in the sequence should use audio features
                     # multimodal_embeddings shape: [num_audio_items, audio_seq_len, hidden_size]
@@ -977,6 +1026,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
                             text_emb = result_emb
                             logger.debug("embed_input_ids: ✅ Audio features ADDED to discrete tokens and scaled by √2")
+                            with open("/tmp/kimi_audio_embed_debug.log", "a") as f:
+                                f.write(f"[embed_input_ids] ✅ Fusion completed! Combined {num_audio_int} audio positions\n")
+                                f.write(f"[embed_input_ids] combined_emb mean={combined_emb.mean().item():.6f}, std={combined_emb.std().item():.6f}\n")
                         else:
                             logger.debug("embed_input_ids: ❌ Shape mismatch! audio_features.shape[0]={audio_features.shape[0]} != num_audio_positions={num_audio_positions}")
                             # Fallback: shapes don't match, apply additive fusion
@@ -1130,6 +1182,10 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         text_sampler_output = sampler(logits=logits, sampling_metadata=sampling_metadata)
         text_tokens = text_sampler_output.sampled_token_ids  # [num_reqs, 1]
 
+        # DEBUG: Log sampled tokens
+        with open("/tmp/kimi_audio_sample_debug.log", "a") as f:
+            f.write(f"[sample] text_tokens shape={text_tokens.shape}, values={text_tokens.tolist() if text_tokens.numel() > 0 else 'empty'}\n")
+
         # 2. Get audio logits (stored by forward() in self._pending_audio_logits)
         audio_logits = self._pending_audio_logits
         if audio_logits is None:
@@ -1140,7 +1196,7 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             # Get or create state for this slot
             state = self._audio_state.setdefault(
                 batch_i,
-                {"generation_step": 0, "audio_out_ids": None}
+                {"generation_step": 0, "audio_out_ids": None, "tokens_after_text": 0}
             )
 
             # Check if text stream already finished for this request
@@ -1155,15 +1211,37 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
             # Handle text stream termination (reference: kimia.py line 134-139)
             if text_finished:
-                # Text stream already finished, replace token with BLANK
-                text_token_id = torch.tensor(self._blank_token_id, device=text_tokens.device, dtype=text_tokens.dtype)
-                text_tokens[batch_i] = self._blank_token_id
-                logger.debug("Text stream finished, replacing token with BLANK")
+                # Text stream already finished
+                # Count tokens generated after text EOS
+                tokens_after_text = state.get("tokens_after_text", 0)
+                max_audio_tokens_after_text = 200  # Generate at most 200 audio tokens after text finishes
+
+                # DEBUG: Log every time we enter this block
+                with open("/tmp/kimi_audio_sample_debug.log", "a") as f:
+                    f.write(f"[{batch_i}] text_finished=True, tokens_after_text={tokens_after_text}/{max_audio_tokens_after_text}\n")
+
+                if tokens_after_text >= max_audio_tokens_after_text:
+                    # Stop generation by returning EOS token
+                    text_token_id = torch.tensor(self._text_eos_id, device=text_tokens.device, dtype=text_tokens.dtype)
+                    text_tokens[batch_i] = self._text_eos_id
+                    logger.debug("Audio generation complete after %d tokens, returning EOS to stop", tokens_after_text)
+                    with open("/tmp/kimi_audio_sample_debug.log", "a") as f:
+                        f.write(f"[{batch_i}] ✅ STOPPING: Returning EOS token {self._text_eos_id}\n")
+                else:
+                    # Replace token with BLANK to continue audio generation
+                    text_token_id = torch.tensor(self._blank_token_id, device=text_tokens.device, dtype=text_tokens.dtype)
+                    text_tokens[batch_i] = self._blank_token_id
+                    state["tokens_after_text"] = tokens_after_text + 1
+                    logger.debug("Text stream finished, replacing token with BLANK (tokens after text: %d/%d)",
+                                tokens_after_text, max_audio_tokens_after_text)
             elif text_token_id == self._text_eos_id:
                 # Text stream just finished, mark it and keep the EOS token
                 # PyTorch can compare tensor == int directly
                 self._text_stream_finished[batch_i] = True
+                state["tokens_after_text"] = 0  # Reset counter
                 logger.debug("Text stream just finished (EOS token detected)")
+                with open("/tmp/kimi_audio_sample_debug.log", "a") as f:
+                    f.write(f"[{batch_i}] 🎯 Text EOS detected! Setting text_finished=True\n")
             # else: text stream still active, keep the sampled token
 
             # 4. Handle audio delay and sampling (reference: kimia.py line 143-149)

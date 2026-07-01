@@ -627,6 +627,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
+        logger.info("[ServingChat] _preprocess_chat called")
         if renderer is None:
             renderer = self.renderer
 
@@ -656,13 +657,112 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         deferred_multi_modal_data: dict[str, Any] | None = None
-        if self._needs_multistage_multimodal_split():
+        needs_split = self._needs_multistage_multimodal_split()
+        logger.info("[ServingChat] Checking if multistage split needed: needs_split=%s", needs_split)
+        if needs_split:
             messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
-        # REMOVED: Special case for Kimi Audio (was here)
-        # Kimi Audio now uses the standard multimodal pipeline
+
+        # Special case for Kimi Audio: convert audio to tensors for proper serialization
+        with open("/tmp/kimi_audio_debug.log", "a") as f:
+            f.write(f"[{time.time()}] Before Kimi Audio conversion: is_kimi={self._is_kimi_audio_model()}, deferred_data={bool(deferred_multi_modal_data)}, keys={list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None}\n")
+            f.flush()
+        print(f"[ServingChat DEBUG] Before Kimi Audio conversion: is_kimi={self._is_kimi_audio_model()}, deferred_data={bool(deferred_multi_modal_data)}, keys={list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None}", flush=True)
+        logger.info("[ServingChat] Before Kimi Audio conversion: is_kimi=%s, deferred_data=%s, keys=%s",
+                   self._is_kimi_audio_model(),
+                   bool(deferred_multi_modal_data),
+                   list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None)
+
+        if self._is_kimi_audio_model() and deferred_multi_modal_data and "audios" in deferred_multi_modal_data:
+            logger.info("[ServingChat] Converting Kimi Audio data to numpy arrays")
+            import io
+            import soundfile as sf
+            import torch
+            import numpy as np
+
+            audio_data = deferred_multi_modal_data["audios"]
+            audio_arrays = []
+            for audio_item in audio_data:
+                if isinstance(audio_item, bytes):
+                    # Raw audio bytes - load and convert to numpy array
+                    wav_array, sr = sf.read(io.BytesIO(audio_item), dtype='float32')
+                    if wav_array.ndim == 1:
+                        wav_array = wav_array.reshape(1, -1)
+                    elif wav_array.ndim == 2:
+                        wav_array = wav_array.T
+                    if sr != 16000:
+                        from scipy import signal
+                        num_samples_16k = int(wav_array.shape[1] * 16000 / sr)
+                        wav_array = signal.resample(wav_array, num_samples_16k, axis=1)
+                    audio_arrays.append(wav_array)
+                elif isinstance(audio_item, np.ndarray):
+                    # Numpy array
+                    if wav_array.ndim == 1:
+                        audio_item = audio_item.reshape(1, -1)
+                    elif audio_item.ndim == 2:
+                        audio_item = audio_item.T
+                    audio_arrays.append(audio_item)
+                elif isinstance(audio_item, torch.Tensor):
+                    # Tensor - convert to numpy
+                    wav_array = audio_item.cpu().numpy()
+                    if wav_array.ndim == 1:
+                        wav_array = wav_array.reshape(1, -1)
+                    elif wav_array.ndim == 2:
+                        wav_array = wav_array.T
+                    audio_arrays.append(wav_array)
+                elif isinstance(audio_item, (list, tuple)) and len(audio_item) == 2:
+                    # Tuple of (audio_array, sample_rate)
+                    audio_array, sr = audio_item
+                    if isinstance(audio_array, np.ndarray):
+                        wav_array = audio_array
+                    else:
+                        wav_array = np.array(audio_array)
+                    if wav_array.ndim == 1:
+                        wav_array = wav_array.reshape(1, -1)
+                    elif wav_array.ndim == 2:
+                        wav_array = wav_array.T
+                    if sr != 16000:
+                        from scipy import signal
+                        num_samples_16k = int(wav_array.shape[1] * 16000 / sr)
+                        wav_array = signal.resample(wav_array, num_samples_16k, axis=1)
+                    audio_arrays.append(wav_array)
+                elif isinstance(audio_item, str):
+                    # String URL - decode base64 data URL
+                    if audio_item.startswith("data:audio"):
+                        import base64
+                        # Parse data URL: data:audio/wav;base64,<base64_data>
+                        parts = audio_item.split(",", 1)
+                        if len(parts) == 2:
+                            base64_data = parts[1]
+                            audio_bytes = base64.b64decode(base64_data)
+                            wav_array, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+                            if wav_array.ndim == 1:
+                                wav_array = wav_array.reshape(1, -1)
+                            elif wav_array.ndim == 2:
+                                wav_array = wav_array.T
+                            if sr != 16000:
+                                from scipy import signal
+                                num_samples_16k = int(wav_array.shape[1] * 16000 / sr)
+                                wav_array = signal.resample(wav_array, num_samples_16k, axis=1)
+                            audio_arrays.append(wav_array)
+                        else:
+                            logger.warning("[ServingChat] Invalid data URL format: %s", audio_item[:100])
+                    else:
+                        logger.warning("[ServingChat] Non-data URL not supported: %s", audio_item[:100])
+                else:
+                    logger.warning("[ServingChat] Unknown audio format: %s", type(audio_item))
+                    audio_arrays.append(audio_item)
+
+            # Store as list of numpy arrays (not stacked tensor) for vLLM's multimodal processor
+            deferred_multi_modal_data["audios"] = audio_arrays
+            logger.info("[ServingChat] Converted %d audio items to numpy arrays", len(audio_arrays))
+            with open("/tmp/kimi_audio_debug.log", "a") as f:
+                f.write(f"[{time.time()}] Converted audio to numpy arrays\n")
+                if audio_arrays:
+                    f.write(f"  First array shape: {audio_arrays[0].shape if hasattr(audio_arrays[0], 'shape') else 'N/A'}\n")
+                f.flush()
 
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
@@ -764,6 +864,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if len(stage_configs) < 2:
             return set()
 
+        # Special case for Kimi Audio: defer "audio" modality for stage 0 (LLM) to process
+        if self._is_kimi_audio_model():
+            logger.info("[ServingChat] Kimi Audio model detected - deferring 'audio' for stage 0")
+            return {"audios"}
+
         first_stage_modalities = self._stage_input_modalities(stage_configs[0])
         logger.info("[ServingChat] first_stage_modalities: %s", first_stage_modalities)
 
@@ -843,7 +948,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             or getattr(stage, "model_stage", "")
         ).lower()
         if model_stage in {"asr", "stt"} or model_stage.endswith("_asr"):
-            return {"audio"}
+            return {"audios"}
         if any(name in model_stage for name in ("vision", "vl", "aura")):
             return {"image", "video"}
         if any(name in model_stage for name in ("tts", "talker", "code2wav")):
@@ -876,6 +981,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             f.flush()
 
         logger.info("[ServingChat] _prepare_kimi_audio_inputs called")
+
+        # Debug: log what's in the messages
+        with open("/tmp/kimi_audio_debug.log", "a") as f:
+            f.write(f"[{time.time()}] Messages received: {len(messages)} messages\n")
+            for i, msg in enumerate(messages):
+                content = msg.get("content") if isinstance(msg, dict) else None
+                f.write(f"  Message {i}: role={msg.get('role')}, content_type={type(content).__name__}")
+                if isinstance(content, list):
+                    f.write(f", content_len={len(content)}")
+                    for j, part in enumerate(content):
+                        if isinstance(part, dict):
+                            f.write(f"\n    Part {j}: type={part.get('type')}")
+                f.write("\n")
+            f.flush()
 
         # Extract audio from messages
         audio_parts: list[Any] = []
@@ -961,16 +1080,46 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             logger.debug("[ServingChat] Materialized %d audio items for model tokenization", len(materialized_audio))
 
+            # Convert audio bytes to tensors for proper serialization
+            # msgspec doesn't serialize bytes in lists correctly, so we convert to tensors
+            import io
+            import soundfile as sf
+            import torch
+            audio_tensors = []
+            for audio_bytes in materialized_audio:
+                if isinstance(audio_bytes, bytes):
+                    # Load audio bytes into numpy array
+                    wav_array, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+                    # Convert to torch tensor
+                    wav_tensor = torch.from_numpy(wav_array)
+                    if wav_tensor.dim() == 1:
+                        wav_tensor = wav_tensor.unsqueeze(0)  # [1, samples]
+                    elif wav_tensor.dim() == 2:
+                        wav_tensor = wav_tensor.T  # [samples, channels] -> [channels, samples]
+                    # Resample to 16kHz if needed
+                    if sr != 16000:
+                        from scipy import signal
+                        num_samples_16k = int(wav_tensor.shape[1] * 16000 / sr)
+                        wav_resampled = signal.resample(wav_tensor.numpy(), num_samples_16k, axis=1)
+                        wav_tensor = torch.from_numpy(wav_resampled).float()
+                    audio_tensors.append(wav_tensor)
+                else:
+                    audio_tensors.append(audio_bytes)
+
             # Write debug info
             with open("/tmp/kimi_audio_debug.log", "a") as f:
-                f.write(f"[{time.time()}] Materialized {len(materialized_audio)} audio items\n")
-                for i, audio in enumerate(materialized_audio):
-                    f.write(f"  Audio {i}: type={type(audio)}, size={len(audio) if hasattr(audio, '__len__') else 'N/A'}\n")
+                f.write(f"[{time.time()}] Materialized {len(audio_tensors)} audio items\n")
+                for i, audio in enumerate(audio_tensors):
+                    f.write(f"  Audio {i}: type={type(audio)}, shape={audio.shape if hasattr(audio, 'shape') else 'N/A'}\n")
                 f.flush()
 
-            # Return stripped messages and deferred data with raw audio bytes
+            # Return stripped messages and deferred data with audio tensors
             # The model will receive this through additional_information and tokenize it
-            return stripped_messages, {"audio": materialized_audio}
+            logger.info("[ServingChat] Returning audio data: type=%s, first_item_type=%s, first_item_shape=%s",
+                       type(audio_tensors),
+                       type(audio_tensors[0]) if audio_tensors else None,
+                       audio_tensors[0].shape if audio_tensors and hasattr(audio_tensors[0], 'shape') else None)
+            return stripped_messages, {"audio": audio_tensors}
 
         except Exception as e:
             logger.error("[ServingChat] Failed to process audio: %s", e)
@@ -993,6 +1142,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for message in messages:
             content = message.get("content") if isinstance(message, dict) else None
+            with open("/tmp/kimi_audio_debug.log", "a") as f:
+                f.write(f"[{time.time()}] Processing message: content_type={type(content).__name__}, is_list={isinstance(content, list)}, content_len={len(content) if isinstance(content, list) else 'N/A'}\n")
+                f.flush()
             if not isinstance(content, list):
                 stripped_messages.append(message)
                 continue
@@ -1000,7 +1152,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stripped_content: list[Any] = []
             changed = False
             for part in content:
+                with open("/tmp/kimi_audio_debug.log", "a") as f:
+                    f.write(f"[{time.time()}] Processing part: type={part.get('type') if isinstance(part, dict) else 'N/A'}, deferred_modalities={deferred_modalities}\n")
+                    f.flush()
                 modality, payload = self._deferred_multimodal_part(part, deferred_modalities)
+                with open("/tmp/kimi_audio_debug.log", "a") as f:
+                    f.write(f"[{time.time()}] _deferred_multimodal_part returned: modality={modality}, payload_type={type(payload).__name__ if payload else 'None'}\n")
+                    f.flush()
                 if modality is not None:
                     if payload is not None:
                         deferred_parts.setdefault(modality, []).append(payload)
@@ -1016,6 +1174,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 stripped_messages.append(message)
 
         deferred_parts = {modality: parts for modality, parts in deferred_parts.items() if parts}
+        with open("/tmp/kimi_audio_debug.log", "a") as f:
+            f.write(f"[{time.time()}] deferred_parts keys: {list(deferred_parts.keys())}, has_audios={'audios' in deferred_parts}\n")
+            f.flush()
         if not deferred_parts:
             return messages, None
 
@@ -1049,7 +1210,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(image, dict):
                 image = image.get("url")
             return "image", image
-        if part_type in {"audio_url", "input_audio", "audio"} and "audio" in deferred_modalities:
+        if part_type in {"audio_url", "input_audio", "audio"} and "audios" in deferred_modalities:
             audio = part.get("audio_url", part.get("input_audio", part.get("audio")))
             if isinstance(audio, dict):
                 url = audio.get("url")
@@ -1063,7 +1224,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     audio = f"data:{mime_type};base64,{data}"
                 else:
                     audio = None
-            return "audio", audio
+            return "audios", audio  # Use "audio" (singular) to match model's expectation
         return None, None
 
     @staticmethod
@@ -1083,7 +1244,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     *(fetch_image(part) if isinstance(part, str) else _identity_async(part) for part in parts)
                 )
             )
-        if modality == "audio":
+        if modality == "audios":  # Use "audios" (plural) to match vLLM's expectation
             fetch_audio = getattr(media_connector, "fetch_audio_async", None)
             if fetch_audio is None:
                 return parts
@@ -2364,7 +2525,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
                     ]
             elif omni_outputs.final_output_type == "audio":
-                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+                # For models like Kimi Audio that produce both text and audio,
+                # we need to combine them into a single choice rather than creating
+                # separate choices. Check if we already have a text choice and add
+                # audio to it.
+                audio_choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+
+                # If we already have choices (from text output), add audio to the first choice
+                if choices and audio_choices_data:
+                    # Find the text choice (should be index 0)
+                    text_choice = next((c for c in choices if c.message.content is not None), None)
+                    if text_choice and audio_choices_data[0].message.audio:
+                        # Add audio to the existing text choice
+                        text_choice.message.audio = audio_choices_data[0].message.audio
+                        # Don't extend choices with audio_choices_data - we've merged it
+                        continue
+
+                # If no text choice exists, use the audio choice as-is
+                choices_data = audio_choices_data
             elif omni_outputs.final_output_type == "image":
                 choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
             else:

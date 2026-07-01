@@ -51,20 +51,27 @@ class CustomKimiAudioMultiModalProcessor(BaseKimiAudioMultiModalProcessor):
         tok_kwargs: dict[str, Any],
     ) -> BatchFeature:
         """Override to pass audio_tokens through."""
-        logger.debug("_call_hf_processor called with mm_data keys: %s", list(mm_data.keys()))
+        logger.warning("_call_hf_processor called with mm_data keys: %s", list(mm_data.keys()))
+        logger.warning("mm_data types: %s", {k: type(v) for k, v in mm_data.items()})
 
         # Call parent processor to get whisper features
         hf_inputs = super()._call_hf_processor(
             prompt, mm_data, mm_kwargs, tok_kwargs
         )
 
-        logger.debug("After parent processor, hf_inputs keys: %s", list(hf_inputs.keys()))
+        logger.warning("After parent processor, hf_inputs keys: %s", list(hf_inputs.keys()))
+        for key in hf_inputs.keys():
+            val = hf_inputs[key]
+            if hasattr(val, 'shape'):
+                logger.warning("  %s: shape=%s, dtype=%s", key, val.shape, val.dtype)
+            else:
+                logger.warning("  %s: type=%s", key, type(val))
 
         # Pass through audio_tokens if present
         if "audio_tokens" in mm_data:
             hf_inputs["audio_tokens"] = mm_data["audio_tokens"]
-            logger.debug("Added audio_tokens to hf_inputs: %d tokens", len(mm_data['audio_tokens']))
+            logger.warning("Added audio_tokens to hf_inputs: %d tokens", len(mm_data['audio_tokens']))
         else:
-            logger.debug("No audio_tokens in mm_data")
+            logger.warning("No audio_tokens in mm_data")
 
         return hf_inputs

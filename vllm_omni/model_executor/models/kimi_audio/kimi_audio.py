@@ -9,10 +9,23 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.inputs import MultiModalDataDict
 from vllm.sequence import IntermediateTensors
+from vllm.multimodal import MULTIMODAL_REGISTRY
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.models.kimi_audio.custom_processor import (
+    CustomKimiAudioMultiModalProcessor,
+)
+from vllm.model_executor.models.kimi_audio import (
+    KimiAudioProcessingInfo,
+    KimiAudioDummyInputsBuilder,
+)
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    CustomKimiAudioMultiModalProcessor,
+    info=KimiAudioProcessingInfo,
+    dummy_inputs=KimiAudioDummyInputsBuilder,
+)
 class KimiAudioForConditionalGeneration(nn.Module):
     """Top-level model that dispatches to stage 0 (LLM) or stage 1 (detokenizer).
 
@@ -67,6 +80,12 @@ class KimiAudioForConditionalGeneration(nn.Module):
         """Compute logits - delegates to the appropriate stage model."""
         if hasattr(self.model, "compute_logits"):
             return self.model.compute_logits(hidden_states, sampling_metadata)
+        return None
+
+    def embed_multimodal(self, **kwargs) -> Optional[list[torch.Tensor]]:
+        """Process multimodal inputs - delegates to the appropriate stage model."""
+        if hasattr(self.model, "embed_multimodal"):
+            return self.model.embed_multimodal(**kwargs)
         return None
 
     def load_weights(self, weights: list[tuple[str, torch.Tensor]]) -> None:
