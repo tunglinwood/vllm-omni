@@ -1216,16 +1216,38 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def make_omni_output(
         self,
-        model_outputs: dict,
+        model_outputs,  # Can be OmniOutput, dict, or tuple (when CUDA graphs are enabled)
         **kwargs,
     ) -> OmniOutput:
         """Package dual-stream output into OmniOutput.
 
         Includes audio tokens for feedback to next step via next_token_id.
         Uses per-slot audio tokens from _last_audio_tokens.
+
+        Handles three cases:
+        1. OmniOutput object (normal eager mode)
+        2. dict (some code paths)
+        3. tuple (CUDA graph mode - tensors are returned directly)
         """
-        text_hidden = model_outputs.get("text_hidden_states")
-        audio_logits = model_outputs.get("audio_logits")
+        # Handle different output formats
+        if isinstance(model_outputs, tuple):
+            # CUDA graph mode: forward() returns (text_hidden_states, audio_logits)
+            # The exact structure depends on what forward() returns
+            if len(model_outputs) >= 2:
+                text_hidden = model_outputs[0]
+                audio_logits = model_outputs[1]
+            else:
+                text_hidden = model_outputs[0]
+                audio_logits = None
+        elif isinstance(model_outputs, dict):
+            text_hidden = model_outputs.get("text_hidden_states")
+            audio_logits = model_outputs.get("audio_logits")
+        else:
+            # OmniOutput object
+            text_hidden = getattr(model_outputs, "text_hidden_states", None)
+            audio_logits = getattr(model_outputs, "audio_logits", None)
+            if audio_logits is None and hasattr(model_outputs, "multimodal_outputs"):
+                audio_logits = model_outputs.multimodal_outputs.get("audio_logits")
 
         # Get the last audio tokens for each request (per-slot)
         last_audio_tokens = getattr(self, "_last_audio_tokens", None)
