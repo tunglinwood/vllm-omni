@@ -727,11 +727,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         deferred_multi_modal_data: dict[str, Any] | None = None
         needs_split = self._needs_multistage_multimodal_split()
         logger.info("[ServingChat] Checking if multistage split needed: needs_split=%s", needs_split)
-        # CRITICAL: For Kimi Audio, we DON'T want to strip audio from messages -
-        # the chat template needs to see the audio content to generate audio
-        # markers (<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>).
-        # Without these markers, vLLM doesn't know where to place audio features
-        # and is_multimodal positions are all False -> whisper features dropped.
+        # For Kimi Audio: we MUST keep audio in messages so the chat template
+        # generates audio markers (<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>).
+        # The Whisper features are extracted from raw audio by the multimodal processor
+        # (upstream-aligned architecture — no GLM-4 discrete tokenization for comprehension).
+        #
+        # Solution: Run the split to extract raw audio into deferred_multi_modal_data,
+        # but discard the stripped messages and use the ORIGINAL messages for
+        # the chat template.
         is_kimi = self._is_kimi_audio_model()
         print(f"[ServingChat._preprocess_chat] BEFORE split: is_kimi={is_kimi}, needs_split={needs_split}, messages count={len(messages)}", flush=True)
         for i, msg in enumerate(messages):
@@ -740,11 +743,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if isinstance(content, list):
                 types = [item.get('type') if isinstance(item, dict) else type(item).__name__ for item in content]
                 print(f"[ServingChat._preprocess_chat] messages[{i}] role={role} content=list of {len(content)}: {types}", flush=True)
-        if needs_split and not is_kimi:
-            messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
+        original_messages_for_kimi = messages  # Preserve original messages with audio_url
+        if needs_split:
+            _, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
+            if is_kimi:
+                # For Kimi, keep original messages (with audio) for chat template;
+                # deferred_multi_modal_data carries the raw audio for Whisper feature extraction.
+                messages = original_messages_for_kimi
         print(f"[ServingChat._preprocess_chat] AFTER split: messages count={len(messages)}, deferred_data={bool(deferred_multi_modal_data)}", flush=True)
         for i, msg in enumerate(messages):
             role = msg.get('role', 'unknown')
@@ -786,11 +794,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         wav_array = signal.resample(wav_array, num_samples_16k, axis=1)
                     audio_arrays.append(wav_array)
                 elif isinstance(audio_item, np.ndarray):
-                    # Numpy array
-                    if audio_item.ndim == 1:
-                        audio_item = audio_item.reshape(1, -1)
-                    elif audio_item.ndim == 2:
-                        audio_item = audio_item.T
                     audio_arrays.append(audio_item)
                 elif isinstance(audio_item, torch.Tensor):
                     # Tensor - convert to numpy
@@ -824,8 +827,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         parts = audio_item.split(",", 1)
                         if len(parts) == 2:
                             base64_data = parts[1]
-                            audio_bytes = base64.b64decode(base64_data)
-                            wav_array, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
+                            raw_bytes = base64.b64decode(base64_data)
+                            wav_array, sr = sf.read(io.BytesIO(raw_bytes), dtype='float32')
                             if wav_array.ndim == 1:
                                 wav_array = wav_array.reshape(1, -1)
                             elif wav_array.ndim == 2:
@@ -843,14 +846,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     logger.warning("[ServingChat] Unknown audio format: %s", type(audio_item))
                     audio_arrays.append(audio_item)
 
-            # Store as list of numpy arrays (not stacked tensor) for vLLM's multimodal processor
+            # Store as list of numpy arrays for vLLM's multimodal processor (Whisper features)
             deferred_multi_modal_data["audios"] = audio_arrays
-            logger.debug("[ServingChat] Converted %d audio items to numpy arrays", len(audio_arrays))
-            with open("/tmp/kimi_audio_debug.log", "a") as f:
-                f.write(f"[{time.time()}] Converted audio to numpy arrays\n")
-                if audio_arrays:
-                    f.write(f"  First array shape: {audio_arrays[0].shape if hasattr(audio_arrays[0], 'shape') else 'N/A'}\n")
-                f.flush()
+            logger.debug("[ServingChat] Converted %d audio items to numpy arrays",
+                         len(audio_arrays))
 
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
