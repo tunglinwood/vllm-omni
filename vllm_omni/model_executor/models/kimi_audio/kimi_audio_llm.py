@@ -465,7 +465,17 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         if inputs_embeds is not None:
             # Use provided embeddings if available
             inputs_embeds_fused = inputs_embeds
+            if not torch.cuda.is_current_stream_capturing():
+                try:
+                    print(f"[forward] inputs_embeds PROVIDED shape={tuple(inputs_embeds.shape)}", file=sys.stderr, flush=True)
+                except Exception:
+                    pass
         else:
+            if not torch.cuda.is_current_stream_capturing():
+                try:
+                    print(f"[forward] NO inputs_embeds, calling embed_input_ids with input_ids shape={tuple(input_ids.shape)}", file=sys.stderr, flush=True)
+                except Exception:
+                    pass
             inputs_embeds_fused = self.embed_input_ids(input_ids, multimodal_embeddings)
 
         # 2. Forward through layers 0-21 (first 22 layers)
@@ -578,13 +588,20 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         This method is called by vLLM's multimodal processing pipeline.
         It processes audio inputs through the Whisper encoder and VQAdaptor.
         """
+        import sys
+        print(f"[embed_multimodal] CALLED with kwargs: {list(kwargs.keys())}", file=sys.stderr, flush=True)
+        logger.error("=== embed_multimodal CALLED ===")
         # Parse audio input from kwargs
         audio_input = self._parse_and_validate_audio_input(**kwargs)
         if audio_input is None:
+            logger.error("embed_multimodal: _parse returned None, returning []")
             return []
+
+        logger.error("embed_multimodal: audio_input keys=%s", list(audio_input.keys()))
 
         # Process audio through Whisper encoder and VQAdaptor
         audio_embeds = self._process_audio_input(audio_input)
+        logger.error("embed_multimodal: audio_embeds shape=%s dtype=%s", tuple(audio_embeds.shape), audio_embeds.dtype)
 
         # Log that audio features successfully reached the model
         logger.info(
@@ -596,14 +613,28 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         # Return as list of 2D tensors, one per batch item
         if audio_embeds.dim() == 3:
             # Unbind batch dimension: [B, T, D] -> list of B tensors [T, D]
-            return list(audio_embeds.unbind(dim=0))
+            result = list(audio_embeds.unbind(dim=0))
+            logger.error("embed_multimodal: returning list of %d tensors, shape=%s", len(result), tuple(result[0].shape) if result else "empty")
+            return result
         else:
             # Single sample: [T, D] -> wrap in list
+            logger.error("embed_multimodal: returning single-item list, shape=%s", tuple(audio_embeds.shape))
             return [audio_embeds]
 
     def _parse_and_validate_audio_input(self, **kwargs: object) -> Optional[dict]:
         """Parse and validate audio input from kwargs."""
-        logger.debug("_parse_and_validate_audio_input: kwargs keys: %s", list(kwargs.keys()))
+        import sys
+        print(f"[_parse_and_validate_audio_input] CALLED with {len(kwargs)} kwargs: {list(kwargs.keys())}", file=sys.stderr, flush=True)
+        logger.error("_parse_and_validate_audio_input: CALLED with %d kwargs", len(kwargs))
+        for k, v in kwargs.items():
+            if v is None:
+                logger.error("  %s = None", k)
+            elif isinstance(v, torch.Tensor):
+                logger.error("  %s = Tensor shape=%s dtype=%s", k, tuple(v.shape), v.dtype)
+            elif isinstance(v, list):
+                logger.error("  %s = list len=%d, first=%s", k, len(v), type(v[0]).__name__ if v else "empty")
+            else:
+                logger.error("  %s = %s (type %s)", k, repr(v)[:200], type(v).__name__)
 
         # Check if audio_tokens are available
         audio_tokens = kwargs.get("audio_tokens", None)
@@ -740,6 +771,9 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
             List of discrete audio token IDs, or None if tokenization fails
         """
         logger.info("_tokenize_audio_to_discrete_tokens: called with type=%s", type(raw_audio))
+        logger.error("_tokenize_audio_to_discrete_tokens: raw_audio repr: %r", raw_audio)
+        if isinstance(raw_audio, str):
+            logger.error("_tokenize_audio_to_discrete_tokens: str len=%d, value=%r", len(raw_audio), raw_audio[:300])
 
         if self.audio_tokenizer is None:
             logger.error("❌ Audio tokenizer not available, cannot tokenize audio")
@@ -748,6 +782,11 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         temp_path = None
         try:
             import numpy as np
+
+            # Guard: if raw_audio is some unexpected string like '<f4', bail out early
+            if isinstance(raw_audio, str) and (raw_audio.startswith('<') or len(raw_audio) < 5 or not any(c.isalpha() for c in raw_audio[:10])):
+                logger.error("❌ raw_audio looks invalid (dtype string?): %r", raw_audio)
+                return None
 
             # Convert raw audio to file path for tokenizer
             if isinstance(raw_audio, bytes):
@@ -888,6 +927,23 @@ class KimiAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal):
         - For continuous whisper features: (text_emb + whisper_emb) × √2
         - For discrete audio tokens: text_emb + audio_emb (simple addition)
         """
+        # Critical debug via stderr
+        import sys
+        me_type = type(multimodal_embeddings).__name__ if multimodal_embeddings is not None else "None"
+        me_info = ""
+        if isinstance(multimodal_embeddings, list):
+            me_info = f"list[{len(multimodal_embeddings)}]"
+            if multimodal_embeddings:
+                first = multimodal_embeddings[0]
+                if hasattr(first, 'shape'):
+                    me_info += f", first_shape={tuple(first.shape)}"
+        elif hasattr(multimodal_embeddings, 'shape'):
+            me_info = f"tensor{tuple(multimodal_embeddings.shape)}"
+        im_info = "None"
+        if is_multimodal is not None:
+            im_info = f"{is_multimodal.sum().item()} of {is_multimodal.shape[0]} True"
+        print(f"[embed_input_ids] input_ids={tuple(input_ids.shape)} mm_embeds={me_type}({me_info}) is_multimodal={im_info}", file=sys.stderr, flush=True)
+
         # 1. Embed text tokens
         text_emb = self.model.model.embed_tokens(input_ids)
 

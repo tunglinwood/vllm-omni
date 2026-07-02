@@ -408,6 +408,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     chat_template_kwargs,
                     self.default_chat_template_kwargs,
                 )
+                # DIAGNOSTIC: show request.messages structure
+                print(f"[ServingChat._preprocess_chat] request.messages count={len(request.messages)}", flush=True)
+                for i, msg in enumerate(request.messages):
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    if isinstance(content, list):
+                        types = [item.get('type') if isinstance(item, dict) else type(item).__name__ for item in content]
+                        print(f"[ServingChat._preprocess_chat] msg[{i}] role={role} content=list of {len(content)}: {types}", flush=True)
+                    else:
+                        content_str = str(content)[:100]
+                        print(f"[ServingChat._preprocess_chat] msg[{i}] role={role} content=str: {content_str!r}", flush=True)
                 conversation, engine_prompts = await self._preprocess_chat(
                     request,
                     request.messages,
@@ -423,6 +434,32 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     documents=getattr(request, "documents", None),
                     add_special_tokens=request.add_special_tokens,
                 )
+                # DIAGNOSTIC: Show engine_prompts content (full, not just preview)
+                print(f"[ServingChat] engine_prompts type={type(engine_prompts).__name__}, len={len(engine_prompts) if hasattr(engine_prompts, '__len__') else 'N/A'}", flush=True)
+                if engine_prompts:
+                    for idx, ep in enumerate(engine_prompts):
+                        if isinstance(ep, dict):
+                            print(f"[ServingChat] engine_prompt[{idx}] type=dict, keys={list(ep.keys())}", flush=True)
+                            if 'prompt_token_ids' in ep:
+                                ptids = ep['prompt_token_ids']
+                                if hasattr(ptids, '__len__'):
+                                    blank_count = sum(1 for t in ptids if t == 151666)
+                                    print(f"[ServingChat] engine_prompt[{idx}]['prompt_token_ids'] len={len(ptids)}, blank(151666) count={blank_count}, first 10={list(ptids[:10])}", flush=True)
+                            if 'mm_kwargs' in ep:
+                                mmk = ep['mm_kwargs']
+                                print(f"[ServingChat] engine_prompt[{idx}]['mm_kwargs'] type={type(mmk).__name__}", flush=True)
+                                if hasattr(mmk, 'items'):
+                                    for k, v in mmk.items():
+                                        if hasattr(v, 'shape'):
+                                            print(f"[ServingChat]   mm_kwargs[{k}].shape={tuple(v.shape)}", flush=True)
+                                        else:
+                                            print(f"[ServingChat]   mm_kwargs[{k}] type={type(v).__name__}", flush=True)
+                            if 'mm_placeholders' in ep:
+                                mmp = ep['mm_placeholders']
+                                print(f"[ServingChat] engine_prompt[{idx}]['mm_placeholders'] = {mmp}", flush=True)
+                            if 'mm_hashes' in ep:
+                                mmh = ep['mm_hashes']
+                                print(f"[ServingChat] engine_prompt[{idx}]['mm_hashes'] = {mmh}", flush=True)
             else:
                 should_include_tools = tool_dicts is not None
                 conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
@@ -690,11 +727,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         deferred_multi_modal_data: dict[str, Any] | None = None
         needs_split = self._needs_multistage_multimodal_split()
         logger.info("[ServingChat] Checking if multistage split needed: needs_split=%s", needs_split)
-        if needs_split:
+        # CRITICAL: For Kimi Audio, we DON'T want to strip audio from messages -
+        # the chat template needs to see the audio content to generate audio
+        # markers (<|im_media_begin|><|im_kimia_text_blank|><|im_media_end|>).
+        # Without these markers, vLLM doesn't know where to place audio features
+        # and is_multimodal positions are all False -> whisper features dropped.
+        is_kimi = self._is_kimi_audio_model()
+        print(f"[ServingChat._preprocess_chat] BEFORE split: is_kimi={is_kimi}, needs_split={needs_split}, messages count={len(messages)}", flush=True)
+        for i, msg in enumerate(messages):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                types = [item.get('type') if isinstance(item, dict) else type(item).__name__ for item in content]
+                print(f"[ServingChat._preprocess_chat] messages[{i}] role={role} content=list of {len(content)}: {types}", flush=True)
+        if needs_split and not is_kimi:
             messages, deferred_multi_modal_data = await self._prepare_multistage_multimodal_inputs(
                 messages,
                 request,
             )
+        print(f"[ServingChat._preprocess_chat] AFTER split: messages count={len(messages)}, deferred_data={bool(deferred_multi_modal_data)}", flush=True)
+        for i, msg in enumerate(messages):
+            role = msg.get('role', 'unknown')
+            content = msg.get('content', '')
+            if isinstance(content, list):
+                types = [item.get('type') if isinstance(item, dict) else type(item).__name__ for item in content]
+                print(f"[ServingChat._preprocess_chat] messages[{i}] role={role} content=list of {len(content)}: {types}", flush=True)
 
         # Special case for Kimi Audio: convert audio to tensors for proper serialization
         with open("/tmp/kimi_audio_debug.log", "a") as f:
@@ -1193,6 +1250,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if modality is not None:
                     if payload is not None:
                         deferred_parts.setdefault(modality, []).append(payload)
+                    # DO NOT insert audio placeholder into stripped_content -
+                    # vLLM will try to materialize it and cause errors.
+                    # Instead, we inject the audio marker directly into the
+                    # rendered prompt for kimi-audio models (see below).
                     changed = True
                     continue
                 stripped_content.append(part)
