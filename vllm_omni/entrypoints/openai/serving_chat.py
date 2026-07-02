@@ -13,12 +13,14 @@ from io import BytesIO
 from typing import Any, Final, cast
 
 import jinja2
+import numpy as np
 import requests
 import torch
 from fastapi import Request
 from openai.types.chat.chat_completion_audio import ChatCompletionAudio as OpenAIChatCompletionAudio
 from PIL import Image
 from pydantic import TypeAdapter
+from scipy import signal as scipy_signal
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
     ChatTemplateContentFormatOption,
@@ -126,6 +128,35 @@ from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.audio import audio_chunk_pcm_bytes, audio_chunk_sample_rate
 
 logger = init_logger(__name__)
+
+
+# Kimi Audio constants
+KIMI_AUDIO_SAMPLE_RATE = 16000  # Target sample rate in Hz
+
+
+def _normalize_audio_array(wav_array: np.ndarray, sr: int) -> np.ndarray:
+    """Normalize audio array to [channels, samples] format at target sample rate.
+
+    Args:
+        wav_array: Audio array in various formats
+        sr: Sample rate of the input audio
+
+    Returns:
+        Normalized audio array with shape [channels, samples] at KIMI_AUDIO_SAMPLE_RATE
+    """
+    # Reshape to [channels, samples]
+    if wav_array.ndim == 1:
+        wav_array = wav_array.reshape(1, -1)
+    elif wav_array.ndim == 2:
+        wav_array = wav_array.T
+
+    # Resample to target sample rate if needed
+    if sr != KIMI_AUDIO_SAMPLE_RATE:
+        num_samples_target = int(wav_array.shape[1] * KIMI_AUDIO_SAMPLE_RATE / sr)
+        wav_array = scipy_signal.resample(wav_array, num_samples_target, axis=1)
+
+    return wav_array
+
 
 
 async def _identity_async(value: Any) -> Any:
@@ -670,13 +701,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             f.write(f"[{time.time()}] Before Kimi Audio conversion: is_kimi={self._is_kimi_audio_model()}, deferred_data={bool(deferred_multi_modal_data)}, keys={list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None}\n")
             f.flush()
         print(f"[ServingChat DEBUG] Before Kimi Audio conversion: is_kimi={self._is_kimi_audio_model()}, deferred_data={bool(deferred_multi_modal_data)}, keys={list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None}", flush=True)
-        logger.info("[ServingChat] Before Kimi Audio conversion: is_kimi=%s, deferred_data=%s, keys=%s",
+        logger.debug("[ServingChat] Before Kimi Audio conversion: is_kimi=%s, deferred_data=%s, keys=%s",
                    self._is_kimi_audio_model(),
                    bool(deferred_multi_modal_data),
                    list(deferred_multi_modal_data.keys()) if deferred_multi_modal_data else None)
 
         if self._is_kimi_audio_model() and deferred_multi_modal_data and "audios" in deferred_multi_modal_data:
-            logger.info("[ServingChat] Converting Kimi Audio data to numpy arrays")
+            logger.debug("[ServingChat] Converting Kimi Audio data to numpy arrays")
             import io
             import soundfile as sf
             import torch
@@ -699,7 +730,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     audio_arrays.append(wav_array)
                 elif isinstance(audio_item, np.ndarray):
                     # Numpy array
-                    if wav_array.ndim == 1:
+                    if audio_item.ndim == 1:
                         audio_item = audio_item.reshape(1, -1)
                     elif audio_item.ndim == 2:
                         audio_item = audio_item.T
@@ -757,7 +788,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             # Store as list of numpy arrays (not stacked tensor) for vLLM's multimodal processor
             deferred_multi_modal_data["audios"] = audio_arrays
-            logger.info("[ServingChat] Converted %d audio items to numpy arrays", len(audio_arrays))
+            logger.debug("[ServingChat] Converted %d audio items to numpy arrays", len(audio_arrays))
             with open("/tmp/kimi_audio_debug.log", "a") as f:
                 f.write(f"[{time.time()}] Converted audio to numpy arrays\n")
                 if audio_arrays:

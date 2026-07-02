@@ -2,7 +2,7 @@
 """Top-level dispatcher for Kimi Audio model."""
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -82,7 +82,7 @@ class KimiAudioForConditionalGeneration(nn.Module):
             return self.model.compute_logits(hidden_states, sampling_metadata)
         return None
 
-    def embed_multimodal(self, **kwargs) -> Optional[list[torch.Tensor]]:
+    def embed_multimodal(self, **kwargs: Any) -> Optional[list[torch.Tensor]]:
         """Process multimodal inputs - delegates to the appropriate stage model."""
         if hasattr(self.model, "embed_multimodal"):
             return self.model.embed_multimodal(**kwargs)
